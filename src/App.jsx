@@ -68,7 +68,7 @@ export default function App() {
   const cargarDatosPerfil = (user) => {
     setName(user.name || ''); setPhone(user.phone || ''); 
     setEmail(user.email || ''); setPassword(user.password || '');
-    setAccountType(user.accountType || 'Individual');
+    setAccountType(user.type || 'Individual'); // CORRECCIÓN: Leemos 'type' en lugar de 'accountType'
   };
 
   const escucharMisViajes = (clientName) => {
@@ -104,11 +104,23 @@ export default function App() {
     try {
       if (isRegistering) {
         if (!name || !phone || !email || !password) throw new Error('Llena todos los campos');
+        
+        // CORRECCIÓN: Alineamos la estructura de datos con lo que espera el Despachador
         const newUser = { 
-            name: name.trim(), phone: phone.trim(), email: email.trim().toLowerCase(), 
-            password, role: 'cliente', status: 'Activo', accountType, 
-            createdAt: new Date().toISOString() 
+            name: name.trim(), 
+            phone: phone.trim(), 
+            email: email.trim().toLowerCase(), 
+            password, 
+            role: 'cliente', 
+            status: 'Activo', 
+            type: accountType, // El Despachador busca la variable 'type'
+            users: [], // Agregamos un array vacío para que el Despachador pueda iterar sin fallar
+            locations: [], // Agregamos un array vacío de locaciones
+            created: new Date().toISOString(), // El Despachador lee 'created'
+            createdAt: new Date().toISOString(), // Mantenemos el antiguo por si acaso
+            joined: new Date().toLocaleDateString() // El Despachador lee 'joined'
         };
+        
         const docRef = await addDoc(collection(db, "clientes"), newUser);
         const userData = { id: docRef.id, ...newUser };
         setCurrentUser(userData); localStorage.setItem('client_session', JSON.stringify(userData));
@@ -131,7 +143,7 @@ export default function App() {
     setLoading(true);
     try {
       const userRef = doc(db, "clientes", currentUser.id);
-      const updatedData = { name: name.trim(), phone: phone.trim(), password, accountType };
+      const updatedData = { name: name.trim(), phone: phone.trim(), password, type: accountType }; // Actualizamos 'type'
       await updateDoc(userRef, updatedData);
       const updatedUser = { ...currentUser, ...updatedData };
       setCurrentUser(updatedUser);
@@ -266,7 +278,7 @@ export default function App() {
   // ================= APLICACIÓN PRINCIPAL =================
   const activeTrips = misViajes.filter(v => v.status === 'En Ruta' || v.status === 'Pendiente');
   const pastTrips = misViajes.filter(v => v.status !== 'En Ruta' && v.status !== 'Pendiente');
-  const isCorporate = currentUser?.accountType === 'Empresa';
+  const isCorporate = currentUser?.type === 'Empresa'; // CORRECCIÓN: Leemos 'type'
   const chatTrip = misViajes.find(v => v.id === activeChatTripId);
 
   return (
@@ -301,6 +313,7 @@ export default function App() {
                           return (
                               <div key={i} className={`flex w-full ${isClient ? 'justify-end' : 'justify-start'}`}>
                                   <div className={`max-w-[80%] p-3 rounded-2xl shadow-sm relative ${isClient ? 'bg-blue-600 text-white rounded-tr-sm' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm'}`}>
+                                      <p className={`text-[9px] font-black uppercase mb-1 ${isClient ? 'hidden' : msg.sender === 'Despacho' ? 'text-blue-500' : 'text-slate-400'}`}>{msg.sender}</p>
                                       <p className="text-sm font-medium leading-snug">{msg.text}</p>
                                       <p className={`text-[9px] mt-1 text-right font-bold ${isClient ? 'text-blue-300' : 'text-slate-400'}`}>{msg.time}</p>
                                   </div>
@@ -556,7 +569,6 @@ export default function App() {
                                     </div>
                                 )}
                                 
-                                {/* --- NUEVO: BOTÓN DE CHAT --- */}
                                 {viaje.driver && viaje.status === 'En Ruta' && (
                                     <button 
                                         onClick={() => setActiveChatTripId(viaje.id)} 
