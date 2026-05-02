@@ -3,7 +3,7 @@ import {
   MapPin, Clock, Calendar, Zap, ChevronRight, User, 
   Mail, Lock, Loader2, LogOut, PlusCircle, History, 
   Car, ShieldCheck, CheckCircle, Navigation, Phone, 
-  Settings, X, Trash2, BellRing, Briefcase, MessageSquare, Send
+  Settings, X, Trash2, BellRing, Briefcase, MessageSquare, Send, CreditCard
 } from 'lucide-react';
 import { db } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion } from 'firebase/firestore';
@@ -11,12 +11,78 @@ import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, 
 // --- GOOGLE MAPS ---
 import { GoogleMap, useJsApiLoader, Autocomplete, Marker, Polyline } from '@react-google-maps/api';
 
+// --- STRIPE ---
+import { loadStripe } from '@stripe/stripe-js';
+import { Elements, CardElement, useStripe, useElements } from '@stripe/react-stripe-js';
+
 const GOOGLE_MAPS_API_KEY = "AIzaSyA-t6YcuPK1PdOoHZJOyOsw6PK0tCDJrn0"; 
-// CAMBIO CLAVE: Se añadió 'geometry' para poder calcular el giro del coche
 const libraries = ['places', 'geometry'];
 
+// INICIALIZAR STRIPE CON TU LLAVE PÚBLICA
+const stripePromise = loadStripe('pk_test_51TSh9M9QuIIjLWZEG2lOhS7Nf8xyMlzZnzL4vSqEbMIwhfBCBbbvhbEbISQFAx9eAgeQBPWHo4xxWQZ3YN1DWMjS0093xZdQv6');
+
 // =========================================================================
-// NUEVO COMPONENTE: RADAR 3D CON RASTREO EN VIVO Y FILTRO ESTABILIZADOR
+// COMPONENTE: FORMULARIO DE TARJETA STRIPE
+// =========================================================================
+const TarjetaForm = ({ clientSecret, customerId, currentUser, onExito }) => {
+    const stripe = useStripe();
+    const elements = useElements();
+    const [cargando, setCargando] = useState(false);
+    const [error, setError] = useState('');
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!stripe || !elements) return;
+        setCargando(true); setError('');
+
+        const { setupIntent, error: stripeError } = await stripe.confirmCardSetup(clientSecret, {
+            payment_method: {
+                card: elements.getElement(CardElement),
+                billing_details: { name: currentUser.name, phone: currentUser.phone },
+            },
+        });
+
+        if (stripeError) {
+            setError(stripeError.message);
+            setCargando(false);
+        } else {
+            // Éxito: Guardamos en Firebase que el cliente ya tiene tarjeta
+            try {
+                await updateDoc(doc(db, "clientes", currentUser.id), {
+                    stripeCustomerId: customerId,
+                    hasCard: true,
+                    paymentMethodId: setupIntent.payment_method
+                });
+                // Actualizamos el localStorage
+                const updatedUser = { ...currentUser, hasCard: true, stripeCustomerId: customerId };
+                localStorage.setItem('client_session', JSON.stringify(updatedUser));
+                onExito(updatedUser);
+            } catch (err) {
+                setError("Error al guardar en la base de datos.");
+            }
+            setCargando(false);
+        }
+    };
+
+    return (
+        <form onSubmit={handleSubmit} className="space-y-4">
+            <div className="p-4 border border-slate-300 rounded-xl bg-white shadow-sm">
+                <CardElement options={{
+                    style: { base: { fontSize: '16px', color: '#1e293b', '::placeholder': { color: '#94a3b8' } }, invalid: { color: '#ef4444' } }
+                }} />
+            </div>
+            {error && <p className="text-red-500 text-xs font-bold text-center">{error}</p>}
+            <button type="submit" disabled={!stripe || cargando} className="w-full bg-blue-600 text-white font-black p-3.5 rounded-xl shadow-lg shadow-blue-500/30 flex justify-center items-center gap-2 active:scale-95 transition">
+                {cargando ? <Loader2 className="w-5 h-5 animate-spin"/> : <><ShieldCheck className="w-5 h-5"/> GUARDAR TARJETA SEGURA</>}
+            </button>
+            <p className="text-[10px] text-center text-slate-400 font-bold uppercase mt-2">Pagos procesados de forma segura por Stripe Inc.</p>
+        </form>
+    );
+};
+
+
+// =========================================================================
+// COMPONENTE: RADAR 3D CON RASTREO EN VIVO Y FILTRO ESTABILIZADOR
 // =========================================================================
 const LiveTrackingMap = ({ viaje }) => {
     const mapRef = useRef(null);
@@ -25,7 +91,6 @@ const LiveTrackingMap = ({ viaje }) => {
 
     const handleLoad = useCallback((map) => {
         mapRef.current = map;
-        // Si el conductor aún NO ha iniciado el viaje, mostramos la ruta completa desde arriba
         if (viaje.technicalData?.geometry?.length > 0 && !viaje.currentLocation) {
             const bounds = new window.google.maps.LatLngBounds();
             viaje.technicalData.geometry.forEach(c => bounds.extend(c));
@@ -34,22 +99,17 @@ const LiveTrackingMap = ({ viaje }) => {
     }, [viaje.technicalData?.geometry, viaje.currentLocation]);
 
     useEffect(() => {
-        // Si no hay mapa o el conductor aún no manda ubicación, no hacemos nada
         if (!viaje.currentLocation || !mapRef.current) return;
         const loc = viaje.currentLocation;
 
-        // El conductor ya está en ruta: Inclinamos el mapa en 3D, hacemos zoom y lo seguimos
         mapRef.current.panTo(loc);
         mapRef.current.setZoom(18); 
         mapRef.current.setTilt(60);
 
-        // Filtro estabilizador de la cámara (igual que el del conductor)
         if (prevLocRef.current && window.google?.maps?.geometry) {
             const p1 = new window.google.maps.LatLng(prevLocRef.current.lat, prevLocRef.current.lng);
             const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
             const dist = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
-
-            // Si se movió más de 3 metros, actualizamos hacia dónde mira el coche y el mapa
             if (dist > 3) { 
                 const newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
                 setHeading(newHeading);
@@ -69,21 +129,16 @@ const LiveTrackingMap = ({ viaje }) => {
             onLoad={handleLoad}
             options={{ 
                 disableDefaultUI: true, 
-                mapId: "73f56298887c80075f6fc648", // TU MAP ID VECTORIAL REAL
+                mapId: "73f56298887c80075f6fc648",
                 gestureHandling: "greedy" 
             }}
         >
-            {/* Dibujamos la línea azul de la ruta */}
             {viaje.technicalData?.geometry && <Polyline path={viaje.technicalData.geometry} options={{ strokeColor: '#3b82f6', strokeOpacity: 0.9, strokeWeight: 6 }} />}
-            
-            {/* Si hay ubicación en vivo, dibujamos el coche verde rotando, si no, un punto A */}
             {viaje.currentLocation ? (
                 <Marker position={viaje.currentLocation} icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: '#22c55e', fillOpacity: 1, strokeWeight: 2, strokeColor: 'white', rotation: heading }} zIndex={999} />
             ) : (
                 viaje.startCoords && <Marker position={viaje.startCoords} label="A" />
             )}
-            
-            {/* Destino final */}
             {viaje.endCoords && <Marker position={viaje.endCoords} label="B" />}
         </GoogleMap>
     );
@@ -97,8 +152,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('pedir');
   const [isEditingProfile, setIsEditingProfile] = useState(false); 
 
-  // --- Formularios ---
-  const [email, setEmail] = useState('');
+  // --- Formularios (SIN EMAIL) ---
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
@@ -117,13 +171,15 @@ export default function App() {
   // --- Datos ---
   const [misViajes, setMisViajes] = useState([]);
   const [dismissedAlerts, setDismissedAlerts] = useState([]);
-  
-  // --- Estado del Chat ---
   const [activeChatTripId, setActiveChatTripId] = useState(null);
   const [chatText, setChatText] = useState('');
   const chatScrollRef = useRef(null);
 
-  // --- Google Maps (Solo para el formulario de Pedir) ---
+  // --- Billetera ---
+  const [clientSecret, setClientSecret] = useState('');
+  const [customerId, setCustomerId] = useState('');
+  const [iniciandoStripe, setIniciandoStripe] = useState(false);
+
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
   const originRef = useRef(null);
   const destRef = useRef(null);
@@ -142,7 +198,7 @@ export default function App() {
 
   const cargarDatosPerfil = (user) => {
     setName(user.name || ''); setPhone(user.phone || ''); 
-    setEmail(user.email || ''); setPassword(user.password || '');
+    setPassword(user.password || '');
     setAccountType(user.type || 'Individual');
   };
 
@@ -170,21 +226,27 @@ export default function App() {
       }
   }, [misViajes, activeChatTripId]);
 
+  // --- AUTH POR TELÉFONO ---
   const handleAuth = async (e) => {
     e.preventDefault();
     setLoading(true); setError('');
     try {
       if (isRegistering) {
-        if (!name || !phone || !email || !password) throw new Error('Llena todos los campos');
-        const newUser = { name: name.trim(), phone: phone.trim(), email: email.trim().toLowerCase(), password, role: 'cliente', status: 'Activo', type: accountType, users: [], locations: [], created: new Date().toISOString(), createdAt: new Date().toISOString(), joined: new Date().toLocaleDateString() };
+        if (!name || !phone || !password) throw new Error('Llena todos los campos');
+
+        const qCheck = query(collection(db, "clientes"), where("phone", "==", phone.trim()));
+        const snapCheck = await getDocs(qCheck);
+        if (!snapCheck.empty) throw new Error('Este número de teléfono ya está registrado.');
+
+        const newUser = { name: name.trim(), phone: phone.trim(), password, role: 'cliente', status: 'Activo', type: accountType, users: [], locations: [], hasCard: false, created: new Date().toISOString(), createdAt: new Date().toISOString(), joined: new Date().toLocaleDateString() };
         const docRef = await addDoc(collection(db, "clientes"), newUser);
         const userData = { id: docRef.id, ...newUser };
         setCurrentUser(userData); localStorage.setItem('client_session', JSON.stringify(userData));
         escucharMisViajes(userData.name);
       } else {
-        const q = query(collection(db, "clientes"), where("email", "==", email.trim().toLowerCase()));
+        const q = query(collection(db, "clientes"), where("phone", "==", phone.trim()));
         const snap = await getDocs(q);
-        if (snap.empty) throw new Error('Usuario no encontrado');
+        if (snap.empty) throw new Error('Número de teléfono no encontrado');
         const userData = { id: snap.docs[0].id, ...snap.docs[0].data() };
         if (userData.password !== password) throw new Error('Contraseña incorrecta');
         setCurrentUser(userData); cargarDatosPerfil(userData); localStorage.setItem('client_session', JSON.stringify(userData));
@@ -212,6 +274,10 @@ export default function App() {
 
   const handlePedirViaje = async (e) => {
     e.preventDefault();
+    
+    // Validación temporal: Quitar el comentario de la siguiente línea si quieres OBLIGAR a que tengan tarjeta para pedir viaje
+    // if(!isCorporate && !currentUser.hasCard) return alert("Por favor, agrega un método de pago en tu Billetera antes de solicitar un viaje.");
+
     if (!origen || !destino) return alert("Ingresa origen y destino");
     if (!origenCoords || !destinoCoords) return alert("Selecciona la dirección sugerida por Google Maps.");
     if (tipoServicio === 'Programado' && (!fecha || !hora)) return alert("Ingresa fecha y hora para programar");
@@ -231,7 +297,7 @@ export default function App() {
       const geometry = routeData.overview_path.map(p => ({ lat: p.lat(), lng: p.lng() }));
 
       const nuevaRuta = {
-        client: currentUser.name || 'Cliente', requestUser: currentUser.email || '', start: origen, startCoords: origenCoords, end: destino, endCoords: destinoCoords, serviceType: tipoServicio, scheduledDate: tipoServicio === 'Programado' ? fecha : new Date().toISOString().split('T')[0], scheduledTime: tipoServicio === 'Programado' ? hora : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), status: 'Pendiente', createdDate: new Date().toISOString(), driverId: '', driver: '', waypoints: [], waypointsData: [], chat: [], technicalData: { totalDistance: distance, totalDuration: duration, geometry: geometry }
+        client: currentUser.name || 'Cliente', requestUser: currentUser.phone || '', start: origen, startCoords: origenCoords, end: destino, endCoords: destinoCoords, serviceType: tipoServicio, scheduledDate: tipoServicio === 'Programado' ? fecha : new Date().toISOString().split('T')[0], scheduledTime: tipoServicio === 'Programado' ? hora : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), status: 'Pendiente', createdDate: new Date().toISOString(), driverId: '', driver: '', waypoints: [], waypointsData: [], chat: [], technicalData: { totalDistance: distance, totalDuration: duration, geometry: geometry }
       };
       
       await addDoc(collection(db, "rutas"), nuevaRuta);
@@ -253,6 +319,28 @@ export default function App() {
       try { await updateDoc(doc(db, "rutas", activeChatTripId), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) { }
   };
 
+  // --- LÓGICA DE BILLETERA ---
+  const iniciarVinculacionTarjeta = async () => {
+      setIniciandoStripe(true);
+      try {
+          const response = await fetch('/api/setup-intent', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ phone: currentUser.phone, name: currentUser.name }),
+          });
+          const data = await response.json();
+          if (data.clientSecret) {
+              setClientSecret(data.clientSecret);
+              setCustomerId(data.customerId);
+          } else {
+              alert("Error al conectar con el servidor bancario.");
+          }
+      } catch (err) {
+          alert("Error de conexión. Verifica tu internet.");
+      }
+      setIniciandoStripe(false);
+  };
+
   if (!currentUser) {
     return (
       <div className="min-h-screen bg-slate-50 flex flex-col justify-center p-6 font-sans text-slate-800">
@@ -262,9 +350,9 @@ export default function App() {
           <p className="text-xs text-center text-slate-500 mb-6">{isRegistering ? 'Solicita unidades al instante' : 'Ingresa para pedir un viaje'}</p>
           <form onSubmit={handleAuth} className="space-y-4">
             {isRegistering && (
-              <><div className="relative"><User className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><input type="text" placeholder="Nombre completo" className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none" value={name} onChange={e=>setName(e.target.value)} required /></div><div className="relative"><Phone className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><input type="tel" placeholder="WhatsApp / Teléfono" className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none" value={phone} onChange={e=>setPhone(e.target.value)} required /></div><div className="relative"><Briefcase className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><select className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none font-bold text-slate-600" value={accountType} onChange={e=>setAccountType(e.target.value)}><option value="Individual">Cuenta Individual (Personal)</option><option value="Empresa">Cuenta Empresa (Corporativo)</option></select></div></>
+              <><div className="relative"><User className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><input type="text" placeholder="Nombre completo" className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none" value={name} onChange={e=>setName(e.target.value)} required /></div><div className="relative"><Briefcase className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><select className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none font-bold text-slate-600" value={accountType} onChange={e=>setAccountType(e.target.value)}><option value="Individual">Cuenta Individual (Personal)</option><option value="Empresa">Cuenta Empresa (Corporativo)</option></select></div></>
             )}
-            <div className="relative"><Mail className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><input type="email" placeholder="Correo electrónico" disabled={!isRegistering && loading} className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none disabled:opacity-50" value={email} onChange={e=>setEmail(e.target.value)} required /></div>
+            <div className="relative"><Phone className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><input type="tel" placeholder="WhatsApp / Teléfono" disabled={!isRegistering && loading} className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none disabled:opacity-50" value={phone} onChange={e=>setPhone(e.target.value)} required /></div>
             <div className="relative"><Lock className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><input type="password" placeholder="Contraseña" className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none" value={password} onChange={e=>setPassword(e.target.value)} required /></div>
             {error && <p className="text-red-500 text-[10px] font-bold text-center">{error}</p>}
             <button type="submit" disabled={loading} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-black p-3.5 rounded-xl flex items-center justify-center transition shadow-lg shadow-blue-500/30">{loading ? <Loader2 className="w-5 h-5 animate-spin" /> : (isRegistering ? 'REGISTRARSE' : 'INICIAR SESIÓN')}</button>
@@ -355,6 +443,8 @@ export default function App() {
       </div>
 
       <div className="flex-1 overflow-y-auto pb-24">
+        
+        {/* --- PESTAÑA: PEDIR VIAJE --- */}
         {activeTab === 'pedir' && (
           <div className="p-5 animate-[fadeIn_0.3s_ease-out]">
             <h1 className="text-2xl font-black text-slate-800 tracking-tight mb-4">¿A dónde vamos?</h1>
@@ -374,6 +464,7 @@ export default function App() {
           </div>
         )}
 
+        {/* --- PESTAÑA: HISTORIAL --- */}
         {activeTab === 'historial' && (
           <div className="p-5 animate-[fadeIn_0.3s_ease-out]">
             <h1 className="text-2xl font-black text-slate-800 tracking-tight mb-4">Mis Viajes</h1>
@@ -396,7 +487,6 @@ export default function App() {
                                 <div className="text-[10px] font-black uppercase bg-black/20 px-2 py-1 rounded-lg">{viaje.serviceType}</div>
                             </div>
 
-                            {/* --- AQUÍ REEMPLAZAMOS EL MAPA ESTÁTICO POR EL NUEVO RADAR EN VIVO --- */}
                             <div className="h-56 bg-slate-200 relative">
                                 {isLoaded ? (
                                     <LiveTrackingMap viaje={viaje} />
@@ -462,11 +552,50 @@ export default function App() {
             )}
           </div>
         )}
+
+        {/* --- PESTAÑA: BILLETERA --- */}
+        {activeTab === 'billetera' && (
+            <div className="p-5 animate-[fadeIn_0.3s_ease-out]">
+                <h1 className="text-2xl font-black text-slate-800 tracking-tight mb-2">Billetera</h1>
+                <p className="text-sm text-slate-500 mb-6">Administra tus métodos de pago para los viajes.</p>
+
+                {currentUser.hasCard ? (
+                    <div className="bg-gradient-to-br from-slate-800 to-slate-900 rounded-3xl p-6 shadow-xl text-white relative overflow-hidden">
+                        <div className="absolute top-0 right-0 w-32 h-32 bg-white opacity-5 rounded-full -mr-10 -mt-10"></div>
+                        <CreditCard className="w-8 h-8 text-blue-400 mb-6" />
+                        <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1">Método de Pago Activo</p>
+                        <p className="text-xl font-mono tracking-widest">**** **** **** ****</p>
+                        <div className="mt-6 flex justify-between items-end">
+                            <div><p className="text-[10px] text-slate-400 uppercase font-bold">Titular</p><p className="text-sm font-bold uppercase">{currentUser.name}</p></div>
+                            <CheckCircle2 className="w-6 h-6 text-green-400" />
+                        </div>
+                    </div>
+                ) : (
+                    <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
+                        <div className="w-16 h-16 bg-blue-50 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-4"><CreditCard className="w-8 h-8"/></div>
+                        <h2 className="text-center font-black text-lg text-slate-800 mb-1">Agrega una Tarjeta</h2>
+                        <p className="text-center text-xs text-slate-500 mb-6">Vincula tu tarjeta de débito o crédito para poder solicitar viajes de forma automática.</p>
+                        
+                        {!clientSecret ? (
+                            <button onClick={iniciarVinculacionTarjeta} disabled={iniciandoStripe} className="w-full bg-slate-800 text-white font-black p-4 rounded-xl shadow-lg flex items-center justify-center gap-2 active:scale-95 transition">
+                                {iniciandoStripe ? <Loader2 className="w-5 h-5 animate-spin"/> : <><PlusCircle className="w-5 h-5"/> VINCULAR TARJETA</>}
+                            </button>
+                        ) : (
+                            <Elements stripe={stripePromise} options={{ clientSecret }}>
+                                <TarjetaForm clientSecret={clientSecret} customerId={customerId} currentUser={currentUser} onExito={(updatedUser) => setCurrentUser(updatedUser)} />
+                            </Elements>
+                        )}
+                    </div>
+                )}
+            </div>
+        )}
       </div>
 
       <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 px-6 py-4 flex justify-around items-center pb-safe shadow-[0_-10px_40px_rgba(0,0,0,0.05)] rounded-t-3xl z-20">
         <button onClick={() => setActiveTab('pedir')} className={`flex flex-col items-center gap-1 transition-all ${activeTab === 'pedir' ? 'text-blue-600 scale-110' : 'text-slate-400 hover:text-slate-600'}`}><PlusCircle className={`w-6 h-6 ${activeTab === 'pedir' && 'fill-blue-50'}`} /><span className="text-[10px] font-black uppercase tracking-widest">Pedir</span></button>
         <button onClick={() => setActiveTab('historial')} className={`flex flex-col items-center gap-1 transition-all ${activeTab === 'historial' ? 'text-blue-600 scale-110' : 'text-slate-400 hover:text-slate-600'}`}><History className={`w-6 h-6 ${activeTab === 'historial' && 'fill-blue-50'}`} /><span className="text-[10px] font-black uppercase tracking-widest">Viajes</span></button>
+        {/* NUEVO BOTÓN: BILLETERA */}
+        <button onClick={() => setActiveTab('billetera')} className={`flex flex-col items-center gap-1 transition-all ${activeTab === 'billetera' ? 'text-blue-600 scale-110' : 'text-slate-400 hover:text-slate-600'}`}><CreditCard className={`w-6 h-6 ${activeTab === 'billetera' && 'fill-blue-50'}`} /><span className="text-[10px] font-black uppercase tracking-widest">Pagos</span></button>
       </div>
     </div>
   );
