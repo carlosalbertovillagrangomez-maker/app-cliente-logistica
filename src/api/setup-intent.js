@@ -1,6 +1,7 @@
 import Stripe from 'stripe';
 
-const stripe = new Stripe('sk_test_51TSh9M9QuIIjLWZE5YWUhtXaOgzI0wlUs2AGELJIvi2DFEv5T1I8qUO0uyLJqNWSTlLY5ElEM8WxPk05YdA3AV9b00jHia5iv4');
+// 🔒 LLamamos a la variable de entorno segura en lugar de poner el texto plano
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 export default async function handler(req, res) {
     if (req.method !== 'POST') {
@@ -32,4 +33,4 @@ export default async function handler(req, res) {
         console.error("Error en Stripe:", error);
         res.status(500).json({ error: error.message });
     }
-}
+}git add src/api/setup-intent.js
