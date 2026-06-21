@@ -1,6 +1,6 @@
 {
-  "name": "Cliente Logística",
-  "short_name": "Logística Cliente",
+  "name": "TripLogix Cliente",
+  "short_name": "TripLogix",
   "description": "Aplicación para clientes de transporte y distribución",
   "start_url": "/",
   "display": "standalone",
