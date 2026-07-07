@@ -22,6 +22,16 @@ const libraries = ['places', 'geometry'];
 const stripePromise = loadStripe('pk_test_51TSh9M9QuIIjLWZEG2lOhS7Nf8xyMlzZnzL4vSqEbMIwhfBCBbbvhbEbISQFAx9eAgeQBPWHo4xxWQZ3YN1DWMjS0093xZdQv6');
 
 // =========================================================================
+// NUEVO: SISTEMA DE ALERTAS SONORAS
+// =========================================================================
+const playAlertSound = () => {
+    try {
+        const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
+        audio.play().catch(e => console.log("Navegador bloqueó el audio automático"));
+    } catch(e) {}
+};
+
+// =========================================================================
 // COMPONENTE: FORMULARIO DE TARJETA STRIPE
 // =========================================================================
 const TarjetaForm = ({ clientSecret, customerId, currentUser, onExito }) => {
@@ -46,14 +56,12 @@ const TarjetaForm = ({ clientSecret, customerId, currentUser, onExito }) => {
             setError(stripeError.message);
             setCargando(false);
         } else {
-            // Éxito: Guardamos en Firebase que el cliente ya tiene tarjeta
             try {
                 await updateDoc(doc(db, "clientes", currentUser.id), {
                     stripeCustomerId: customerId,
                     hasCard: true,
                     paymentMethodId: setupIntent.payment_method
                 });
-                // Actualizamos el localStorage
                 const updatedUser = { ...currentUser, hasCard: true, stripeCustomerId: customerId };
                 localStorage.setItem('client_session', JSON.stringify(updatedUser));
                 onExito(updatedUser);
@@ -91,10 +99,17 @@ const LiveTrackingMap = ({ viaje }) => {
 
     const handleLoad = useCallback((map) => {
         mapRef.current = map;
+        // FIX: Candado de seguridad para evitar PANTALLA BLANCA
         if (viaje.technicalData?.geometry?.length > 0 && !viaje.currentLocation) {
             const bounds = new window.google.maps.LatLngBounds();
-            viaje.technicalData.geometry.forEach(c => bounds.extend(c));
-            map.fitBounds(bounds);
+            let hasValidPoints = false;
+            viaje.technicalData.geometry.forEach(c => {
+                if (c && typeof c.lat === 'number' && typeof c.lng === 'number') {
+                    bounds.extend(c);
+                    hasValidPoints = true;
+                }
+            });
+            if (hasValidPoints) map.fitBounds(bounds);
         }
     }, [viaje.technicalData?.geometry, viaje.currentLocation]);
 
@@ -174,6 +189,9 @@ export default function App() {
   const [activeChatTripId, setActiveChatTripId] = useState(null);
   const [chatText, setChatText] = useState('');
   const chatScrollRef = useRef(null);
+  
+  // Ref para detectar cambios y hacer sonar la alerta
+  const prevTripsRef = useRef({});
 
   // --- Billetera ---
   const [clientSecret, setClientSecret] = useState('');
@@ -212,13 +230,37 @@ export default function App() {
     });
   };
 
-  const arrivingTrip = misViajes.find(v => v.status === 'En Ruta' && v.proximityAlert?.active && !dismissedAlerts.includes(v.id));
-
+  // --- CONTROL DE ALERTAS SONORAS ---
   useEffect(() => {
-      if (arrivingTrip && "vibrate" in navigator) {
-          navigator.vibrate([500, 200, 500, 200, 1000]);
+      let shouldRing = false;
+      const newState = {};
+      
+      misViajes.forEach(v => {
+          newState[v.id] = { 
+              status: v.status, 
+              chatLen: v.chat?.length || 0, 
+              isArriving: v.proximityAlert?.active 
+          };
+          
+          const prev = prevTripsRef.current[v.id];
+          if (prev) {
+              // Si nos aceptan el viaje
+              if (prev.status === 'Pendiente' && v.status === 'Aceptada') shouldRing = true;
+              // Si el chofer manda mensaje
+              if (prev.chatLen < (v.chat?.length || 0) && v.chat[v.chat.length - 1].sender !== 'Cliente') shouldRing = true;
+              // Si el chofer está llegando
+              if (!prev.isArriving && v.proximityAlert?.active) shouldRing = true;
+          }
+      });
+
+      if (shouldRing) {
+          playAlertSound();
+          if ("vibrate" in navigator) navigator.vibrate([300, 100, 300]);
       }
-  }, [arrivingTrip]);
+      prevTripsRef.current = newState;
+  }, [misViajes]);
+
+  const arrivingTrip = misViajes.find(v => v.status === 'En Ruta' && v.proximityAlert?.active && !dismissedAlerts.includes(v.id));
 
   useEffect(() => {
       if (chatScrollRef.current) {
@@ -292,19 +334,46 @@ export default function App() {
       });
       
       const routeData = results.routes[0];
-      const distance = routeData.legs[0].distance.text;
-      const duration = routeData.legs[0].duration.text;
+      // FIX: Obtenemos los valores numéricos para evitar que diga "15 km km" o crashee
+      const distanceValue = routeData.legs[0].distance.value; 
+      const durationValue = routeData.legs[0].duration.value;
+      const distanceKm = (distanceValue / 1000).toFixed(1);
+      const durationMin = Math.round(durationValue / 60);
       const geometry = routeData.overview_path.map(p => ({ lat: p.lat(), lng: p.lng() }));
 
       const nuevaRuta = {
-        client: currentUser.name || 'Cliente', requestUser: currentUser.phone || '', start: origen, startCoords: origenCoords, end: destino, endCoords: destinoCoords, serviceType: tipoServicio, scheduledDate: tipoServicio === 'Programado' ? fecha : new Date().toISOString().split('T')[0], scheduledTime: tipoServicio === 'Programado' ? hora : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), status: 'Pendiente', createdDate: new Date().toISOString(), driverId: '', driver: '', waypoints: [], waypointsData: [], chat: [], technicalData: { totalDistance: distance, totalDuration: duration, geometry: geometry }
+        client: currentUser.name || 'Cliente', 
+        requestUser: currentUser.phone || '', 
+        start: origen, 
+        // FIX: Inyectamos el passengerName para que la app del conductor lo vea
+        startCoords: { lat: origenCoords.lat, lng: origenCoords.lng, passengerName: currentUser.name, contact: currentUser.phone }, 
+        end: destino, 
+        endCoords: { lat: destinoCoords.lat, lng: destinoCoords.lng, passengerName: currentUser.name, contact: currentUser.phone }, 
+        serviceType: tipoServicio, 
+        scheduledDate: tipoServicio === 'Programado' ? fecha : new Date().toISOString().split('T')[0], 
+        scheduledTime: tipoServicio === 'Programado' ? hora : new Date().toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute: '2-digit' }), 
+        status: 'Pendiente', 
+        createdDate: new Date().toISOString(), 
+        driverId: '', 
+        driver: '', 
+        waypoints: [], 
+        waypointsData: [], 
+        chat: [], 
+        technicalData: { 
+            totalDistance: distanceKm, 
+            totalDuration: durationMin, 
+            geometry: geometry 
+        }
       };
       
       await addDoc(collection(db, "rutas"), nuevaRuta);
       alert("¡Viaje solicitado con éxito!");
       setOrigen(''); setDestino(''); setOrigenCoords(null); setDestinoCoords(null);
       setActiveTab('historial');
-    } catch (err) { alert("Error calculando la ruta. Intenta de nuevo."); }
+    } catch (err) { 
+        console.error(err);
+        alert("Error calculando la ruta. Verifica tu conexión o intenta con otra dirección."); 
+    }
     setLoading(false);
   };
 
@@ -315,7 +384,7 @@ export default function App() {
 
   const enviarMensajeCliente = async () => {
       if (!chatText.trim() || !activeChatTripId) return;
-      const msg = { sender: 'Cliente', text: chatText.trim(), time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), timestamp: new Date().toISOString() };
+      const msg = { sender: 'Cliente', text: chatText.trim(), time: new Date().toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute:'2-digit' }), timestamp: new Date().toISOString() };
       try { await updateDoc(doc(db, "rutas", activeChatTripId), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) { }
   };
 
