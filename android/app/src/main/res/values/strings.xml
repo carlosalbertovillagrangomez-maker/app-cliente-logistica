@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">TripLogix Cliente</string>
+    <string name="title_activity_main">TripLogix Cliente</string>
+    <string name="package_name">com.triplogix.cliente</string>
+    <string name="custom_url_scheme">com.triplogix.cliente</string>
+</resources>

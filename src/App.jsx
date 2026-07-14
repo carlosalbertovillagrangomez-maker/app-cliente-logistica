@@ -90,72 +90,341 @@ const TarjetaForm = ({ clientSecret, customerId, currentUser, onExito }) => {
 
 
 // =========================================================================
-// COMPONENTE: RADAR 3D CON RASTREO EN VIVO Y FILTRO ESTABILIZADOR
+// HELPERS: MAPA EN VIVO DEL CLIENTE
 // =========================================================================
-const LiveTrackingMap = ({ viaje }) => {
+const MAP_CENTER_MX = { lat: 19.4326, lng: -99.1332 };
+
+const toFiniteNumber = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+};
+
+const normalizePoint = (point) => {
+    if (!point) return null;
+
+    const lat = toFiniteNumber(point.lat);
+    const lng = toFiniteNumber(point.lng ?? point.lon);
+
+    if (lat === null || lng === null) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+
+    return { ...point, lat, lng };
+};
+
+const normalizePath = (path) => {
+    if (!Array.isArray(path)) return [];
+    return path.map(normalizePoint).filter(Boolean);
+};
+
+const getDistanceMeters = (p1, p2) => {
+    const a = normalizePoint(p1);
+    const b = normalizePoint(p2);
+    if (!a || !b) return Infinity;
+
+    const R = 6371e3;
+    const lat1 = a.lat * Math.PI / 180;
+    const lat2 = b.lat * Math.PI / 180;
+    const dLat = (b.lat - a.lat) * Math.PI / 180;
+    const dLng = (b.lng - a.lng) * Math.PI / 180;
+
+    const h = Math.sin(dLat / 2) ** 2 +
+        Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+
+    return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+};
+
+const getSafeMetric = (value, fallback = '--') => {
+    if (value === null || value === undefined || value === '') return fallback;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return value;
+};
+
+const getDriverCarIcon = () => {
+    if (!window.google?.maps) return undefined;
+
+    const svg = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="46" height="46" viewBox="0 0 46 46">
+          <circle cx="23" cy="23" r="21" fill="#f97316" stroke="white" stroke-width="4"/>
+          <path d="M14 25.5V21c0-.9.4-1.8 1.1-2.4l2.2-5c.4-.9 1.3-1.6 2.3-1.6h6.8c1 0 1.9.6 2.3 1.6l2.2 5c.7.6 1.1 1.5 1.1 2.4v4.5c0 .8-.7 1.5-1.5 1.5H29v2c0 .6-.4 1-1 1h-1.2c-.6 0-1-.4-1-1v-2h-5.6v2c0 .6-.4 1-1 1H18c-.6 0-1-.4-1-1v-2h-1.5c-.8 0-1.5-.7-1.5-1.5Z" fill="white"/>
+          <path d="M18.8 15h8.4l1.7 3.8H17.1L18.8 15Z" fill="#fdba74"/>
+          <circle cx="18.4" cy="23.2" r="1.7" fill="#0f172a"/>
+          <circle cx="27.6" cy="23.2" r="1.7" fill="#0f172a"/>
+        </svg>
+    `;
+
+    return {
+        url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+        scaledSize: new window.google.maps.Size(46, 46),
+        anchor: new window.google.maps.Point(23, 23)
+    };
+};
+
+const getRemainingWaypointsForClient = (viaje) => {
+    const waypoints = Array.isArray(viaje?.waypointsData) ? viaje.waypointsData : [];
+
+    // Se toma el índice más avanzado disponible. Esto evita volver a incluir
+    // paradas que el conductor ya confirmó y reduce diferencias de km/ETA.
+    const evidenceIndexes = [
+        ...(Array.isArray(viaje?.evidenciasLlegada) ? viaje.evidenciasLlegada : []),
+        ...(Array.isArray(viaje?.evidencias) ? viaje.evidencias : [])
+    ]
+        .map(item => Number(item?.stopIndex))
+        .filter(Number.isFinite)
+        .map(index => index + 1);
+
+    const candidates = [
+        Number(viaje?.currentStopIndex),
+        Number(viaje?.nextStopIdx),
+        Number(viaje?.proximityAlert?.stopIndex),
+        ...evidenceIndexes,
+        0
+    ].filter(Number.isFinite);
+
+    const stopIndex = Math.max(0, ...candidates);
+
+    return waypoints
+        .filter((_, idx) => (idx + 1) >= stopIndex)
+        .map(normalizePoint)
+        .filter(Boolean)
+        .slice(0, 23);
+};
+
+// =========================================================================
+// COMPONENTE: MAPA EN VIVO CON RECÁLCULO DE RUTA
+// =========================================================================
+const LiveTrackingMap = ({ viaje, expanded = false, onMetricsChange }) => {
     const mapRef = useRef(null);
-    const prevLocRef = useRef(null);
-    const [heading, setHeading] = useState(0);
+    const lastRouteRequestRef = useRef(0);
+    const lastRouteOriginRef = useRef(null);
+    const lastRouteSignatureRef = useRef('');
+    const [routePath, setRoutePath] = useState(() => {
+        const livePath = normalizePath(viaje?.liveRouteGeometry);
+        return livePath.length > 0 ? livePath : normalizePath(viaje?.technicalData?.geometry);
+    });
+    const [isRecalculating, setIsRecalculating] = useState(false);
+
+    const driverPoint = normalizePoint(viaje?.currentLocation);
+    const startPoint = normalizePoint(viaje?.startCoords);
+    const endPoint = normalizePoint(viaje?.endCoords);
+    const plannedPath = normalizePath(viaje?.technicalData?.geometry);
+    const fallbackLivePath = normalizePath(viaje?.liveRouteGeometry);
+    const visiblePath = routePath.length > 0 ? routePath : (fallbackLivePath.length > 0 ? fallbackLivePath : plannedPath);
+    const center = driverPoint || startPoint || visiblePath[0] || MAP_CENTER_MX;
+
+    const fitRoute = useCallback((map, path, point) => {
+        if (!map || !window.google?.maps) return;
+
+        try {
+            if (expanded && path.length > 1) {
+                const bounds = new window.google.maps.LatLngBounds();
+                path.forEach(p => bounds.extend({ lat: p.lat, lng: p.lng }));
+                if (point) bounds.extend({ lat: point.lat, lng: point.lng });
+                map.fitBounds(bounds, 45);
+                return;
+            }
+
+            if (point) {
+                map.panTo(point);
+                map.setZoom(17);
+                return;
+            }
+
+            if (path.length > 1) {
+                const bounds = new window.google.maps.LatLngBounds();
+                path.forEach(p => bounds.extend({ lat: p.lat, lng: p.lng }));
+                map.fitBounds(bounds, 35);
+            }
+        } catch (e) {
+            console.error('No se pudo ajustar el mapa del cliente:', e);
+        }
+    }, [expanded]);
 
     const handleLoad = useCallback((map) => {
         mapRef.current = map;
-        // FIX: Candado de seguridad para evitar PANTALLA BLANCA
-        if (viaje.technicalData?.geometry?.length > 0 && !viaje.currentLocation) {
-            const bounds = new window.google.maps.LatLngBounds();
-            let hasValidPoints = false;
-            viaje.technicalData.geometry.forEach(c => {
-                if (c && typeof c.lat === 'number' && typeof c.lng === 'number') {
-                    bounds.extend(c);
-                    hasValidPoints = true;
-                }
-            });
-            if (hasValidPoints) map.fitBounds(bounds);
-        }
-    }, [viaje.technicalData?.geometry, viaje.currentLocation]);
+        try {
+            if (typeof map.setTilt === 'function') map.setTilt(0);
+            if (typeof map.setHeading === 'function') map.setHeading(0);
+        } catch (e) {}
+        fitRoute(map, visiblePath, driverPoint);
+    }, [fitRoute, visiblePath, driverPoint]);
 
     useEffect(() => {
-        if (!viaje.currentLocation || !mapRef.current) return;
-        const loc = viaje.currentLocation;
+        if (!mapRef.current) return;
+        fitRoute(mapRef.current, visiblePath, driverPoint);
+    }, [visiblePath, driverPoint, fitRoute]);
 
-        mapRef.current.panTo(loc);
-        mapRef.current.setZoom(18); 
-        mapRef.current.setTilt(60);
+    useEffect(() => {
+        if (!window.google?.maps || !endPoint) return;
 
-        if (prevLocRef.current && window.google?.maps?.geometry) {
-            const p1 = new window.google.maps.LatLng(prevLocRef.current.lat, prevLocRef.current.lng);
-            const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
-            const dist = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
-            if (dist > 3) { 
-                const newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
-                setHeading(newHeading);
-                mapRef.current.setHeading(newHeading);
-                prevLocRef.current = loc;
+        const origin = driverPoint || startPoint;
+        if (!origin) return;
+
+        const waypointPoints = viaje?.status === 'En Ruta'
+            ? getRemainingWaypointsForClient(viaje)
+            : [];
+
+        const routeSignature = JSON.stringify({
+            id: viaje?.id,
+            status: viaje?.status,
+            dLat: Number(endPoint.lat).toFixed(5),
+            dLng: Number(endPoint.lng).toFixed(5),
+            wp: waypointPoints.map(w => `${Number(w.lat).toFixed(5)},${Number(w.lng).toFixed(5)}`)
+        });
+
+        const now = Date.now();
+        const elapsed = now - lastRouteRequestRef.current;
+        const routeStructureChanged = routeSignature !== lastRouteSignatureRef.current;
+        const movedMeters = lastRouteOriginRef.current
+            ? getDistanceMeters(lastRouteOriginRef.current, origin)
+            : Infinity;
+
+        // Protección para Android WebView:
+        // - nunca dispara solicitudes consecutivas en menos de 8 segundos;
+        // - después recalcula al cambiar paradas/destino, mover 40 m o cada 15 segundos.
+        if (elapsed < 8000) return;
+        if (!routeStructureChanged && movedMeters < 40 && elapsed < 15000) return;
+
+        lastRouteSignatureRef.current = routeSignature;
+        lastRouteOriginRef.current = origin;
+        lastRouteRequestRef.current = now;
+
+        let cancelled = false;
+        setIsRecalculating(true);
+
+        const directionsService = new window.google.maps.DirectionsService();
+
+        directionsService.route({
+            origin: { lat: origin.lat, lng: origin.lng },
+            destination: { lat: endPoint.lat, lng: endPoint.lng },
+            waypoints: waypointPoints.map(p => ({
+                location: { lat: p.lat, lng: p.lng },
+                stopover: true
+            })),
+            optimizeWaypoints: false,
+            travelMode: window.google.maps.TravelMode.DRIVING
+        }, (result, status) => {
+            if (cancelled) return;
+            setIsRecalculating(false);
+
+            if (status !== window.google.maps.DirectionsStatus.OK || !result?.routes?.[0]) {
+                const fallbackDistance = viaje?.technicalData?.totalDistance || '--';
+                const fallbackDuration = viaje?.technicalData?.totalDuration || '--';
+
+                if (onMetricsChange && viaje?.id) {
+                    onMetricsChange(viaje.id, {
+                        totalDistance: fallbackDistance,
+                        totalDuration: fallbackDuration,
+                        isLive: false
+                    });
+                }
+                return;
             }
-        } else {
-            prevLocRef.current = loc;
-        }
-    }, [viaje.currentLocation]);
+
+            const route = result.routes[0];
+            const dynamicPath = normalizePath(route.overview_path.map(p => ({ lat: p.lat(), lng: p.lng() })));
+
+            let totalDistanceMeters = 0;
+            let totalDurationSeconds = 0;
+
+            route.legs.forEach(leg => {
+                totalDistanceMeters += leg.distance?.value || 0;
+                totalDurationSeconds += leg.duration?.value || 0;
+            });
+
+            const metrics = {
+                totalDistance: (totalDistanceMeters / 1000).toFixed(1),
+                totalDuration: Math.max(1, Math.round(totalDurationSeconds / 60)),
+                nextStopDistance: route.legs?.[0]?.distance?.value ? (route.legs[0].distance.value / 1000).toFixed(1) : '',
+                nextStopDuration: route.legs?.[0]?.duration?.value ? Math.max(1, Math.round(route.legs[0].duration.value / 60)) : '',
+                isLive: Boolean(driverPoint),
+                recalculatedAt: new Date().toISOString()
+            };
+
+            setRoutePath(dynamicPath);
+
+            if (onMetricsChange && viaje?.id) {
+                onMetricsChange(viaje.id, metrics);
+            }
+        });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [
+        viaje?.id,
+        viaje?.status,
+        viaje?.currentLocation?.lat,
+        viaje?.currentLocation?.lng,
+        viaje?.endCoords?.lat,
+        viaje?.endCoords?.lng,
+        viaje?.startCoords?.lat,
+        viaje?.startCoords?.lng,
+        viaje?.proximityAlert?.stopIndex
+    ]);
+
+    const driverIcon = getDriverCarIcon();
 
     return (
-        <GoogleMap
-            mapContainerStyle={{ width: '100%', height: '100%' }}
-            center={viaje.currentLocation || viaje.startCoords || { lat: 19.4326, lng: -99.1332 }}
-            zoom={14}
-            onLoad={handleLoad}
-            options={{ 
-                disableDefaultUI: true, 
-                mapId: "73f56298887c80075f6fc648",
-                gestureHandling: "greedy" 
-            }}
-        >
-            {viaje.technicalData?.geometry && <Polyline path={viaje.technicalData.geometry} options={{ strokeColor: '#f97316', strokeOpacity: 0.9, strokeWeight: 6 }} />}
-            {viaje.currentLocation ? (
-                <Marker position={viaje.currentLocation} icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: '#22c55e', fillOpacity: 1, strokeWeight: 2, strokeColor: 'white', rotation: heading }} zIndex={999} />
-            ) : (
-                viaje.startCoords && <Marker position={viaje.startCoords} label="A" />
+        <div className="relative w-full h-full">
+            <GoogleMap
+                mapContainerStyle={{ width: '100%', height: '100%' }}
+                center={center}
+                zoom={driverPoint ? 17 : 14}
+                onLoad={handleLoad}
+                onUnmount={() => { mapRef.current = null; }}
+                options={{
+                    disableDefaultUI: true,
+                    gestureHandling: "greedy",
+                    backgroundColor: "#e2e8f0"
+                }}
+            >
+                {plannedPath.length > 0 && routePath.length > 0 && (
+                    <Polyline
+                        path={plannedPath}
+                        options={{
+                            strokeColor: '#94a3b8',
+                            strokeOpacity: 0.35,
+                            strokeWeight: 4
+                        }}
+                    />
+                )}
+
+                {visiblePath.length > 0 && (
+                    <Polyline
+                        path={visiblePath}
+                        options={{
+                            strokeColor: '#f97316',
+                            strokeOpacity: 0.95,
+                            strokeWeight: expanded ? 7 : 6
+                        }}
+                    />
+                )}
+
+                {startPoint && !driverPoint && (
+                    <Marker position={startPoint} label="A" />
+                )}
+
+                {driverPoint && (
+                    <Marker
+                        position={driverPoint}
+                        icon={driverIcon}
+                        zIndex={999}
+                    />
+                )}
+
+                {endPoint && (
+                    <Marker position={endPoint} label="B" />
+                )}
+            </GoogleMap>
+
+            {isRecalculating && (
+                <div className="absolute top-3 left-3 bg-white/95 backdrop-blur px-3 py-2 rounded-full shadow-lg border border-slate-200 flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-orange-500" />
+                    <span className="text-[10px] font-black uppercase text-slate-600">Recalculando ruta</span>
+                </div>
             )}
-            {viaje.endCoords && <Marker position={viaje.endCoords} label="B" />}
-        </GoogleMap>
+        </div>
     );
 };
 // =========================================================================
@@ -187,6 +456,8 @@ export default function App() {
   const [misViajes, setMisViajes] = useState([]);
   const [dismissedAlerts, setDismissedAlerts] = useState([]);
   const [activeChatTripId, setActiveChatTripId] = useState(null);
+  const [expandedMapTripId, setExpandedMapTripId] = useState(null);
+  const [liveTripMetrics, setLiveTripMetrics] = useState({});
   const [chatText, setChatText] = useState('');
   const chatScrollRef = useRef(null);
   
@@ -201,6 +472,27 @@ export default function App() {
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
   const originRef = useRef(null);
   const destRef = useRef(null);
+
+  const handleLiveMetricsChange = useCallback((tripId, metrics) => {
+    if (!tripId || !metrics) return;
+
+    setLiveTripMetrics(prev => {
+        const current = prev[tripId] || {};
+        const same =
+            current.totalDistance === metrics.totalDistance &&
+            current.totalDuration === metrics.totalDuration &&
+            current.nextStopDistance === metrics.nextStopDistance &&
+            current.nextStopDuration === metrics.nextStopDuration &&
+            current.isLive === metrics.isLive;
+
+        if (same) return prev;
+
+        return {
+            ...prev,
+            [tripId]: metrics
+        };
+    });
+  }, []);
 
   useEffect(() => {
     const savedUser = localStorage.getItem('client_session');
@@ -451,10 +743,60 @@ export default function App() {
   const pastTrips = misViajes.filter(v => v.status !== 'En Ruta' && v.status !== 'Pendiente' && v.status !== 'Aceptada');
   const isCorporate = currentUser?.type === 'Empresa';
   const chatTrip = misViajes.find(v => v.id === activeChatTripId);
+  const expandedMapTrip = misViajes.find(v => v.id === expandedMapTripId);
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans flex flex-col relative">
-      
+
+      {expandedMapTrip && (
+          <div className="fixed inset-0 z-[9998] bg-slate-950 flex flex-col animate-[fadeIn_0.2s_ease-out]">
+              <div className="bg-slate-900 text-white p-4 pt-6 flex items-center justify-between shadow-lg z-10 shrink-0">
+                  <div>
+                      <p className="text-[10px] font-black text-orange-400 uppercase tracking-widest">Mapa expandido</p>
+                      <h2 className="text-base font-black leading-tight">{expandedMapTrip.driver || 'Conductor'} en camino</h2>
+                      <p className="text-[10px] text-slate-400 line-clamp-1">{expandedMapTrip.end}</p>
+                  </div>
+                  <button onClick={() => setExpandedMapTripId(null)} className="p-3 bg-white/10 rounded-full active:scale-95 transition">
+                      <X className="w-5 h-5" />
+                  </button>
+              </div>
+
+              <div className="flex-1 min-h-0 relative">
+                  {isLoaded ? (
+                      <LiveTrackingMap
+                          viaje={expandedMapTrip}
+                          expanded={true}
+                          onMetricsChange={handleLiveMetricsChange}
+                      />
+                  ) : (
+                      <div className="w-full h-full flex items-center justify-center text-white">
+                          <Loader2 className="w-7 h-7 animate-spin text-orange-500" />
+                      </div>
+                  )}
+              </div>
+
+              <div className="bg-white p-4 rounded-t-[2rem] shadow-[0_-10px_35px_rgba(0,0,0,0.25)] shrink-0">
+                  <div className="grid grid-cols-2 gap-3">
+                      <div className="bg-orange-50 border border-orange-100 rounded-2xl p-4">
+                          <p className="text-[10px] font-black uppercase text-orange-500">Distancia restante</p>
+                          <p className="text-2xl font-black text-orange-900">
+                              {getSafeMetric(liveTripMetrics[expandedMapTrip.id]?.totalDistance || expandedMapTrip.technicalData?.totalDistance)} <span className="text-sm">km</span>
+                          </p>
+                      </div>
+                      <div className="bg-green-50 border border-green-100 rounded-2xl p-4 text-right">
+                          <p className="text-[10px] font-black uppercase text-green-600">Llegada en</p>
+                          <p className="text-2xl font-black text-green-700">
+                              {getSafeMetric(liveTripMetrics[expandedMapTrip.id]?.totalDuration || expandedMapTrip.technicalData?.totalDuration)} <span className="text-sm">min</span>
+                          </p>
+                      </div>
+                  </div>
+                  <button onClick={() => setExpandedMapTripId(null)} className="w-full mt-3 bg-slate-800 text-white font-black p-3.5 rounded-2xl active:scale-95 transition">
+                      CERRAR MAPA
+                  </button>
+              </div>
+          </div>
+      )}
+
       {activeChatTripId && chatTrip && (
           <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm animate-[fadeIn_0.2s_ease-out]">
               <div className="bg-slate-50 w-full max-w-sm h-[85vh] rounded-[2rem] shadow-2xl flex flex-col overflow-hidden border border-slate-200 relative">
@@ -558,7 +900,14 @@ export default function App() {
               <div className="space-y-6">
                 {activeTrips.map(viaje => {
                     const isArriving = viaje.status === 'En Ruta' && viaje.proximityAlert?.active;
-                    const distanciaKm = parseFloat(viaje.technicalData?.totalDistance) || 0;
+                    const liveMetrics = liveTripMetrics[viaje.id] || {};
+                    const displayDistance = viaje.status === 'En Ruta'
+                        ? (liveMetrics.totalDistance || viaje.technicalData?.totalDistance || '--')
+                        : (viaje.technicalData?.totalDistance || '--');
+                    const displayDuration = viaje.status === 'En Ruta'
+                        ? (liveMetrics.totalDuration || viaje.technicalData?.totalDuration || '--')
+                        : (viaje.technicalData?.totalDuration || '--');
+                    const distanciaKm = parseFloat(displayDistance) || parseFloat(viaje.technicalData?.totalDistance) || 0;
                     const costoEstimado = (distanciaKm * 15 + 35).toFixed(2); 
 
                     return (
@@ -573,9 +922,24 @@ export default function App() {
 
                             <div className="h-56 bg-slate-200 relative">
                                 {isLoaded ? (
-                                    <LiveTrackingMap viaje={viaje} />
+                                    <LiveTrackingMap
+                                        viaje={viaje}
+                                        onMetricsChange={handleLiveMetricsChange}
+                                    />
                                 ) : (
                                     <div className="w-full h-full flex items-center justify-center text-slate-400"><Loader2 className="w-6 h-6 animate-spin"/></div>
+                                )}
+                                <button
+                                    type="button"
+                                    onClick={() => setExpandedMapTripId(viaje.id)}
+                                    className="absolute top-3 right-3 bg-white/95 backdrop-blur text-slate-800 border border-slate-200 shadow-lg rounded-full px-3 py-2 text-[10px] font-black uppercase tracking-widest active:scale-95 transition"
+                                >
+                                    Expandir
+                                </button>
+                                {viaje.status === 'En Ruta' && liveMetrics.isLive && (
+                                    <div className="absolute bottom-3 left-3 bg-slate-900/90 text-white rounded-full px-3 py-2 text-[10px] font-black uppercase tracking-widest shadow-lg">
+                                        Ruta en vivo
+                                    </div>
                                 )}
                             </div>
 
@@ -584,9 +948,9 @@ export default function App() {
                                     <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200">
                                         <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3 flex items-center gap-1.5"><Briefcase className="w-3 h-3"/> Métrica Corporativa</p>
                                         <div className="flex justify-between items-center">
-                                            <div><p className="text-[10px] font-bold text-slate-500 uppercase">Recorrido Total</p><p className="text-2xl font-black text-slate-800">{viaje.technicalData?.totalDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p></div>
+                                            <div><p className="text-[10px] font-bold text-slate-500 uppercase">Recorrido Total</p><p className="text-2xl font-black text-slate-800">{displayDistance} <span className="text-sm font-medium text-slate-500">km</span></p></div>
                                             <div className="w-px h-10 bg-slate-200"></div>
-                                            <div className="text-right"><p className="text-[10px] font-bold text-slate-500 uppercase">Llegada Estimada</p><p className="text-2xl font-black text-orange-600">{viaje.technicalData?.totalDuration || '--'} <span className="text-sm font-medium text-orange-500">min</span></p></div>
+                                            <div className="text-right"><p className="text-[10px] font-bold text-slate-500 uppercase">Llegada Estimada</p><p className="text-2xl font-black text-orange-600">{displayDuration} <span className="text-sm font-medium text-orange-500">min</span></p></div>
                                         </div>
                                         <div className="mt-4 pt-3 border-t border-slate-200 flex items-center gap-3">
                                             <div className="w-10 h-10 bg-slate-200 rounded-full flex items-center justify-center text-slate-500"><User className="w-5 h-5"/></div>
@@ -596,8 +960,8 @@ export default function App() {
                                 ) : (
                                     <div className="space-y-4">
                                         <div className="flex justify-between items-center bg-orange-50 p-4 rounded-2xl border border-orange-100">
-                                            <div><p className="text-[10px] font-black uppercase text-orange-500">Distancia</p><p className="text-xl font-black text-orange-900">{viaje.technicalData?.totalDistance || '--'} <span className="text-sm">km</span></p></div>
-                                            <div className="text-right"><p className="text-[10px] font-black uppercase text-orange-500">Llegada en</p><p className="text-xl font-black text-orange-900">{viaje.technicalData?.totalDuration || '--'} <span className="text-sm">min</span></p></div>
+                                            <div><p className="text-[10px] font-black uppercase text-orange-500">Distancia</p><p className="text-xl font-black text-orange-900">{displayDistance} <span className="text-sm">km</span></p></div>
+                                            <div className="text-right"><p className="text-[10px] font-black uppercase text-orange-500">Llegada en</p><p className="text-xl font-black text-orange-900">{displayDuration} <span className="text-sm">min</span></p></div>
                                         </div>
                                         <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm flex items-center justify-between">
                                             <div className="flex items-center gap-3"><div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-slate-500"><User className="w-6 h-6"/></div><div><p className="text-[10px] font-black text-slate-400 uppercase">Tu Conductor</p><p className="text-sm font-bold text-slate-800">{viaje.driver || 'Asignando...'}</p>{viaje.driver && <p className="text-[10px] font-bold text-slate-400 mt-0.5">Unidad Estándar</p>}</div></div>
