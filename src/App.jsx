@@ -140,6 +140,67 @@ const getSafeMetric = (value, fallback = '--') => {
     return value;
 };
 
+
+const normalizeFrequentLocation = (location, index = 0) => {
+    if (!location || typeof location === 'string') return null;
+
+    const point = normalizePoint(location.coords || location);
+    const address = String(
+        location.address ||
+        location.formattedAddress ||
+        location.formatted_address ||
+        location.description ||
+        ''
+    ).trim();
+
+    if (!point || !address) return null;
+
+    const fallbackLabel = address.split(',')[0]?.trim() || `Dirección ${index + 1}`;
+
+    return {
+        label: String(location.label || location.name || fallbackLabel).trim(),
+        address,
+        lat: point.lat,
+        lng: point.lng,
+        updatedAt: location.updatedAt || location.savedAt || new Date().toISOString()
+    };
+};
+
+const getFrequentLocationKey = (location) => {
+    const normalized = normalizeFrequentLocation(location);
+    if (!normalized) return '';
+    return `${normalized.lat.toFixed(5)}|${normalized.lng.toFixed(5)}|${normalized.address.toLowerCase()}`;
+};
+
+const mergeFrequentLocations = (existingLocations, newLocations, limit = 8) => {
+    const merged = [];
+    const seen = new Set();
+
+    [...(newLocations || []), ...(existingLocations || [])].forEach((location, index) => {
+        const normalized = normalizeFrequentLocation(location, index);
+        if (!normalized) return;
+
+        const key = getFrequentLocationKey(normalized);
+        if (!key || seen.has(key)) return;
+
+        seen.add(key);
+        merged.push(normalized);
+    });
+
+    return merged.slice(0, limit);
+};
+
+const getTripDriverLabel = (trip) => {
+    if (trip?.driver) return trip.driver;
+    if (trip?.ofertaEstado === 'Pendiente' && trip?.ofertaParaNombre) {
+        return `${trip.ofertaParaNombre} · Confirmando`;
+    }
+    if (trip?.assignmentStatus === 'Sin conductores disponibles') {
+        return 'Buscando conductor disponible';
+    }
+    return 'Asignando...';
+};
+
 const getDriverCarIcon = () => {
     if (!window.google?.maps) return undefined;
 
@@ -451,6 +512,9 @@ export default function App() {
   const [tipoServicio, setTipoServicio] = useState('Prioritario');
   const [fecha, setFecha] = useState('');
   const [hora, setHora] = useState('');
+  const [frequentLocations, setFrequentLocations] = useState([]);
+  const [routeReview, setRouteReview] = useState(null);
+  const [isConfirmingTrip, setIsConfirmingTrip] = useState(false);
 
   // --- Datos ---
   const [misViajes, setMisViajes] = useState([]);
@@ -463,6 +527,7 @@ export default function App() {
   
   // Ref para detectar cambios y hacer sonar la alerta
   const prevTripsRef = useRef({});
+  const reassignmentInProgressRef = useRef(new Set());
 
   // --- Billetera ---
   const [clientSecret, setClientSecret] = useState('');
@@ -510,6 +575,12 @@ export default function App() {
     setName(user.name || ''); setPhone(user.phone || ''); 
     setPassword(user.password || '');
     setAccountType(user.type || 'Individual');
+    setFrequentLocations(
+        (Array.isArray(user.locations) ? user.locations : [])
+            .map(normalizeFrequentLocation)
+            .filter(Boolean)
+            .slice(0, 8)
+    );
   };
 
   const escucharMisViajes = (clientName) => {
@@ -521,6 +592,150 @@ export default function App() {
       setMisViajes(viajes);
     });
   };
+
+
+  const obtenerConductorDisponible = useCallback(async (originPoint, excludedDriverIds = []) => {
+      const excluded = new Set((excludedDriverIds || []).filter(Boolean));
+      const origin = normalizePoint(originPoint);
+
+      const [driversSnapshot, activeRoutesSnapshot] = await Promise.all([
+          getDocs(query(collection(db, 'conductores'), where('isOnline', '==', true))),
+          getDocs(query(collection(db, 'rutas'), where('status', '==', 'En Ruta')))
+      ]);
+
+      const busyDriverIds = new Set(
+          activeRoutesSnapshot.docs
+              .map(item => item.data()?.driverId)
+              .filter(Boolean)
+      );
+
+      const candidates = driversSnapshot.docs
+          .map(item => ({ id: item.id, ...item.data() }))
+          .filter(driver => driver.status === 'Aprobado')
+          .filter(driver => driver.isOnline === true)
+          .filter(driver => !busyDriverIds.has(driver.id))
+          .filter(driver => !excluded.has(driver.id))
+          .map(driver => {
+              const driverLocation = normalizePoint(driver.currentLocation);
+              const distanceMeters = origin && driverLocation
+                  ? getDistanceMeters(origin, driverLocation)
+                  : Number.POSITIVE_INFINITY;
+
+              return {
+                  ...driver,
+                  driverLocation,
+                  distanceMeters
+              };
+          })
+          .sort((a, b) => {
+              const aHasLocation = Number.isFinite(a.distanceMeters);
+              const bHasLocation = Number.isFinite(b.distanceMeters);
+
+              if (aHasLocation && !bHasLocation) return -1;
+              if (!aHasLocation && bHasLocation) return 1;
+              if (a.distanceMeters !== b.distanceMeters) return a.distanceMeters - b.distanceMeters;
+              return String(a.name || '').localeCompare(String(b.name || ''));
+          });
+
+      return candidates[0] || null;
+  }, []);
+
+  const guardarDireccionesFrecuentes = useCallback(async (locationsToSave) => {
+      if (!currentUser?.id) return;
+
+      const merged = mergeFrequentLocations(frequentLocations, locationsToSave, 8);
+      setFrequentLocations(merged);
+
+      const updatedUser = {
+          ...currentUser,
+          locations: merged
+      };
+
+      setCurrentUser(updatedUser);
+      localStorage.setItem('client_session', JSON.stringify(updatedUser));
+
+      try {
+          await updateDoc(doc(db, 'clientes', currentUser.id), {
+              locations: merged
+          });
+      } catch (error) {
+          console.error('No se pudieron guardar las direcciones frecuentes:', error);
+      }
+  }, [currentUser, frequentLocations]);
+
+  const usarDireccionFrecuente = (location, target) => {
+      const normalized = normalizeFrequentLocation(location);
+      if (!normalized) return;
+
+      const coords = { lat: normalized.lat, lng: normalized.lng };
+
+      if (target === 'origen') {
+          setOrigen(normalized.address);
+          setOrigenCoords(coords);
+      } else {
+          setDestino(normalized.address);
+          setDestinoCoords(coords);
+      }
+  };
+
+  const limpiarOrigen = () => {
+      setOrigen('');
+      setOrigenCoords(null);
+  };
+
+  const limpiarDestino = () => {
+      setDestino('');
+      setDestinoCoords(null);
+  };
+
+  // Reasignación automática cuando un conductor rechaza la oferta.
+  // El flujo principal sigue siendo: cliente solicita -> conductor cercano recibe oferta -> conductor acepta.
+  useEffect(() => {
+      const candidates = misViajes.filter(viaje =>
+          viaje.status === 'Pendiente' &&
+          viaje.ofertaEstado === 'Rechazada' &&
+          !viaje.ofertaPara
+      );
+
+      candidates.forEach(async (viaje) => {
+          if (reassignmentInProgressRef.current.has(viaje.id)) return;
+          reassignmentInProgressRef.current.add(viaje.id);
+
+          try {
+              const excluded = [
+                  ...(Array.isArray(viaje.assignmentTriedDriverIds) ? viaje.assignmentTriedDriverIds : []),
+                  ...(Array.isArray(viaje.rechazadoPor) ? viaje.rechazadoPor : [])
+              ];
+
+              const nextDriver = await obtenerConductorDisponible(viaje.startCoords, excluded);
+
+              if (nextDriver) {
+                  await updateDoc(doc(db, 'rutas', viaje.id), {
+                      ofertaPara: nextDriver.id,
+                      ofertaParaNombre: nextDriver.name || 'Conductor',
+                      ofertaEstado: 'Pendiente',
+                      assignmentStatus: 'Oferta enviada',
+                      assignmentTriedDriverIds: Array.from(new Set([...excluded, nextDriver.id])),
+                      lastAssignmentAt: new Date().toISOString()
+                  });
+              } else {
+                  await updateDoc(doc(db, 'rutas', viaje.id), {
+                      ofertaPara: '',
+                      ofertaParaNombre: '',
+                      ofertaEstado: 'Sin disponibilidad',
+                      assignmentStatus: 'Sin conductores disponibles',
+                      lastAssignmentAt: new Date().toISOString()
+                  });
+              }
+          } catch (error) {
+              console.error('No se pudo reasignar el viaje:', error);
+          } finally {
+              setTimeout(() => {
+                  reassignmentInProgressRef.current.delete(viaje.id);
+              }, 15000);
+          }
+      });
+  }, [misViajes, obtenerConductorDisponible]);
 
   // --- CONTROL DE ALERTAS SONORAS ---
   useEffect(() => {
@@ -608,15 +823,20 @@ export default function App() {
 
   const handlePedirViaje = async (e) => {
     e.preventDefault();
-    
-    // Validación temporal: Quitar el comentario de la siguiente línea si quieres OBLIGAR a que tengan tarjeta para pedir viaje
-    // if(!isCorporate && !currentUser.hasCard) return alert("Por favor, agrega un método de pago en tu Billetera antes de solicitar un viaje.");
 
-    if (!origen || !destino) return alert("Ingresa origen y destino");
-    if (!origenCoords || !destinoCoords) return alert("Selecciona la dirección sugerida por Google Maps.");
-    if (tipoServicio === 'Programado' && (!fecha || !hora)) return alert("Ingresa fecha y hora para programar");
+    if (!origen || !destino) return alert('Ingresa origen y destino');
+    if (!origenCoords || !destinoCoords) {
+        return alert('Selecciona ambas direcciones desde las sugerencias de Google Maps o desde tus direcciones frecuentes.');
+    }
+    if (tipoServicio === 'Programado' && (!fecha || !hora)) {
+        return alert('Ingresa fecha y hora para programar');
+    }
+    if (!isLoaded || !window.google?.maps?.DirectionsService) {
+        return alert('Google Maps todavía está cargando. Espera unos segundos e inténtalo nuevamente.');
+    }
 
     setLoading(true);
+
     try {
       const directionsService = new window.google.maps.DirectionsService();
       const results = await directionsService.route({
@@ -624,49 +844,163 @@ export default function App() {
           destination: destinoCoords,
           travelMode: window.google.maps.TravelMode.DRIVING,
       });
-      
-      const routeData = results.routes[0];
-      // FIX: Obtenemos los valores numéricos para evitar que diga "15 km km" o crashee
-      const distanceValue = routeData.legs[0].distance.value; 
-      const durationValue = routeData.legs[0].duration.value;
-      const distanceKm = (distanceValue / 1000).toFixed(1);
-      const durationMin = Math.round(durationValue / 60);
-      const geometry = routeData.overview_path.map(p => ({ lat: p.lat(), lng: p.lng() }));
 
-      const nuevaRuta = {
-        client: currentUser.name || 'Cliente', 
-        requestUser: currentUser.phone || '', 
-        start: origen, 
-        // FIX: Inyectamos el passengerName para que la app del conductor lo vea
-        startCoords: { lat: origenCoords.lat, lng: origenCoords.lng, passengerName: currentUser.name, contact: currentUser.phone }, 
-        end: destino, 
-        endCoords: { lat: destinoCoords.lat, lng: destinoCoords.lng, passengerName: currentUser.name, contact: currentUser.phone }, 
-        serviceType: tipoServicio, 
-        scheduledDate: tipoServicio === 'Programado' ? fecha : new Date().toISOString().split('T')[0], 
-        scheduledTime: tipoServicio === 'Programado' ? hora : new Date().toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute: '2-digit' }), 
-        status: 'Pendiente', 
-        createdDate: new Date().toISOString(), 
-        driverId: '', 
-        driver: '', 
-        waypoints: [], 
-        waypointsData: [], 
-        chat: [], 
-        technicalData: { 
-            totalDistance: distanceKm, 
-            totalDuration: durationMin, 
-            geometry: geometry 
+      const routeData = results?.routes?.[0];
+      const firstLeg = routeData?.legs?.[0];
+
+      if (!routeData || !firstLeg) {
+          throw new Error('Google Maps no devolvió una ruta válida.');
+      }
+
+      const distanceValue = firstLeg.distance?.value || 0;
+      const durationValue = firstLeg.duration?.value || 0;
+      const distanceKm = (distanceValue / 1000).toFixed(1);
+      const durationMin = Math.max(1, Math.round(durationValue / 60));
+      const geometry = routeData.overview_path.map(point => ({
+          lat: point.lat(),
+          lng: point.lng()
+      }));
+
+      const scheduledDate = tipoServicio === 'Programado'
+          ? fecha
+          : new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+
+      const scheduledTime = tipoServicio === 'Programado'
+          ? hora
+          : new Date().toLocaleTimeString('es-MX', {
+              timeZone: 'America/Mexico_City',
+              hour: '2-digit',
+              minute: '2-digit'
+          });
+
+      const estimatedCost = (Number(distanceKm) * 15 + 35).toFixed(2);
+
+      const routePayload = {
+        client: currentUser.name || 'Cliente',
+        requestUser: currentUser.phone || '',
+        clientPhone: currentUser.phone || '',
+        start: origen,
+        startCoords: {
+            lat: origenCoords.lat,
+            lng: origenCoords.lng,
+            passengerName: currentUser.name,
+            contact: currentUser.phone
+        },
+        end: destino,
+        endCoords: {
+            lat: destinoCoords.lat,
+            lng: destinoCoords.lng,
+            passengerName: currentUser.name,
+            contact: currentUser.phone
+        },
+        serviceType: tipoServicio,
+        scheduledDate,
+        scheduledTime,
+        status: 'Pendiente',
+        createdDate: new Date().toISOString(),
+        driverId: '',
+        driver: '',
+        waypoints: [],
+        waypointsData: [],
+        chat: [],
+        assignmentStatus: 'Preparando asignación',
+        assignmentTriedDriverIds: [],
+        technicalData: {
+            totalDistance: distanceKm,
+            totalDuration: durationMin,
+            geometry
         }
       };
-      
-      await addDoc(collection(db, "rutas"), nuevaRuta);
-      alert("¡Viaje solicitado con éxito!");
-      setOrigen(''); setDestino(''); setOrigenCoords(null); setDestinoCoords(null);
-      setActiveTab('historial');
-    } catch (err) { 
+
+      // No guardamos todavía. Primero se muestra un resumen para que el usuario
+      // confirme o regrese a corregir cualquier dirección.
+      setRouteReview({
+          routePayload,
+          distanceKm,
+          durationMin,
+          estimatedCost,
+          scheduledDate,
+          scheduledTime
+      });
+    } catch (err) {
         console.error(err);
-        alert("Error calculando la ruta. Verifica tu conexión o intenta con otra dirección."); 
+        alert('Error calculando la ruta. Verifica tu conexión o intenta con otra dirección.');
+    } finally {
+        setLoading(false);
     }
-    setLoading(false);
+  };
+
+  const confirmarSolicitudViaje = async () => {
+      if (!routeReview?.routePayload || isConfirmingTrip) return;
+
+      setIsConfirmingTrip(true);
+
+      try {
+          const baseRoute = routeReview.routePayload;
+          const conductor = await obtenerConductorDisponible(baseRoute.startCoords, []);
+          const nowIso = new Date().toISOString();
+
+          const assignmentData = conductor
+              ? {
+                    ofertaPara: conductor.id,
+                    ofertaParaNombre: conductor.name || 'Conductor',
+                    ofertaEstado: 'Pendiente',
+                    assignmentStatus: 'Oferta enviada',
+                    assignmentTriedDriverIds: [conductor.id],
+                    assignmentRequestedAt: nowIso,
+                    assignmentDistanceMeters: Number.isFinite(conductor.distanceMeters)
+                        ? Math.round(conductor.distanceMeters)
+                        : null
+                }
+              : {
+                    ofertaPara: '',
+                    ofertaParaNombre: '',
+                    ofertaEstado: 'Sin disponibilidad',
+                    assignmentStatus: 'Sin conductores disponibles',
+                    assignmentTriedDriverIds: [],
+                    assignmentRequestedAt: nowIso
+                };
+
+          await addDoc(collection(db, 'rutas'), {
+              ...baseRoute,
+              ...assignmentData
+          });
+
+          await guardarDireccionesFrecuentes([
+              {
+                  label: baseRoute.start.split(',')[0] || 'Origen frecuente',
+                  address: baseRoute.start,
+                  lat: baseRoute.startCoords.lat,
+                  lng: baseRoute.startCoords.lng,
+                  updatedAt: nowIso
+              },
+              {
+                  label: baseRoute.end.split(',')[0] || 'Destino frecuente',
+                  address: baseRoute.end,
+                  lat: baseRoute.endCoords.lat,
+                  lng: baseRoute.endCoords.lng,
+                  updatedAt: nowIso
+              }
+          ]);
+
+          if (conductor) {
+              alert(`¡Viaje solicitado! Se envió la solicitud al conductor disponible más cercano: ${conductor.name || 'Conductor'}.`);
+          } else {
+              alert('¡Viaje solicitado! En este momento no hay conductores conectados; la solicitud quedó registrada para asignación.');
+          }
+
+          setRouteReview(null);
+          limpiarOrigen();
+          limpiarDestino();
+          setFecha('');
+          setHora('');
+          setActiveTab('historial');
+      } catch (error) {
+          console.error('Error confirmando viaje:', error);
+          alert('No fue posible registrar el viaje. Revisa tu conexión e inténtalo nuevamente.');
+      } finally {
+          setIsConfirmingTrip(false);
+      }
   };
 
   const handleCancelarViaje = async (viajeId) => {
@@ -747,6 +1081,88 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans flex flex-col relative">
+
+      {routeReview && (
+          <div className="fixed inset-0 z-[10000] bg-slate-900/80 backdrop-blur-md flex items-center justify-center p-4">
+              <div className="w-full max-w-md bg-white rounded-[2rem] shadow-2xl overflow-hidden border border-slate-200">
+                  <div className="bg-slate-800 text-white p-5">
+                      <p className="text-[10px] font-black uppercase tracking-widest text-orange-300">Revisa antes de solicitar</p>
+                      <h2 className="text-xl font-black mt-1">Confirma los datos de tu viaje</h2>
+                      <p className="text-xs text-slate-300 mt-1">Puedes regresar y corregir cualquier dirección sin perder la información.</p>
+                  </div>
+
+                  <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+                      <div className="rounded-2xl border border-slate-200 p-4">
+                          <div className="flex gap-3">
+                              <div className="mt-1 w-3 h-3 rounded-full bg-green-500 shrink-0"></div>
+                              <div>
+                                  <p className="text-[10px] font-black uppercase text-slate-400">Origen</p>
+                                  <p className="text-sm font-bold text-slate-800 mt-1">{routeReview.routePayload.start}</p>
+                              </div>
+                          </div>
+                          <div className="ml-1.5 h-5 border-l-2 border-dashed border-slate-200"></div>
+                          <div className="flex gap-3">
+                              <div className="mt-1 w-3 h-3 rounded-full bg-orange-500 shrink-0"></div>
+                              <div>
+                                  <p className="text-[10px] font-black uppercase text-slate-400">Destino</p>
+                                  <p className="text-sm font-bold text-slate-800 mt-1">{routeReview.routePayload.end}</p>
+                              </div>
+                          </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3">
+                          <div className="bg-orange-50 border border-orange-100 rounded-2xl p-4">
+                              <p className="text-[10px] font-black uppercase text-orange-500">Distancia</p>
+                              <p className="text-2xl font-black text-orange-900 mt-1">{routeReview.distanceKm} <span className="text-sm">km</span></p>
+                          </div>
+                          <div className="bg-green-50 border border-green-100 rounded-2xl p-4 text-right">
+                              <p className="text-[10px] font-black uppercase text-green-600">Tiempo estimado</p>
+                              <p className="text-2xl font-black text-green-800 mt-1">{routeReview.durationMin} <span className="text-sm">min</span></p>
+                          </div>
+                      </div>
+
+                      <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4">
+                          <div className="flex justify-between gap-4">
+                              <div>
+                                  <p className="text-[10px] font-black uppercase text-slate-400">Servicio</p>
+                                  <p className="text-sm font-black text-slate-800 mt-1">{routeReview.routePayload.serviceType}</p>
+                              </div>
+                              <div className="text-right">
+                                  <p className="text-[10px] font-black uppercase text-slate-400">Fecha y hora</p>
+                                  <p className="text-sm font-black text-slate-800 mt-1">{routeReview.scheduledDate} · {routeReview.scheduledTime}</p>
+                              </div>
+                          </div>
+                          {!isCorporate && (
+                              <div className="mt-4 pt-3 border-t border-slate-200 flex justify-between items-center">
+                                  <p className="text-xs font-bold text-slate-500">Tarifa estimada</p>
+                                  <p className="text-2xl font-black text-slate-800">${routeReview.estimatedCost}</p>
+                              </div>
+                          )}
+                      </div>
+                  </div>
+
+                  <div className="p-5 pt-0 grid grid-cols-2 gap-3">
+                      <button
+                          type="button"
+                          onClick={() => setRouteReview(null)}
+                          disabled={isConfirmingTrip}
+                          className="p-4 rounded-2xl bg-slate-100 text-slate-700 font-black text-xs uppercase tracking-widest active:scale-95 transition disabled:opacity-50"
+                      >
+                          Corregir datos
+                      </button>
+                      <button
+                          type="button"
+                          onClick={confirmarSolicitudViaje}
+                          disabled={isConfirmingTrip}
+                          className="p-4 rounded-2xl bg-orange-500 text-white font-black text-xs uppercase tracking-widest shadow-xl shadow-orange-500/30 flex items-center justify-center gap-2 active:scale-95 transition disabled:opacity-60"
+                      >
+                          {isConfirmingTrip ? <Loader2 className="w-5 h-5 animate-spin" /> : <CheckCircle className="w-5 h-5" />}
+                          Confirmar viaje
+                      </button>
+                  </div>
+              </div>
+          </div>
+      )}
 
       {expandedMapTrip && (
           <div className="fixed inset-0 z-[9998] bg-slate-950 flex flex-col animate-[fadeIn_0.2s_ease-out]">
@@ -873,24 +1289,203 @@ export default function App() {
         {/* --- PESTAÑA: PEDIR VIAJE --- */}
         {activeTab === 'pedir' && (
           <div className="p-5 animate-[fadeIn_0.3s_ease-out]">
-            <h1 className="text-2xl font-black text-slate-800 tracking-tight mb-4">¿A dónde vamos?</h1>
+            <h1 className="text-2xl font-black text-slate-800 tracking-tight mb-1">¿A dónde vamos?</h1>
+            <p className="text-xs text-slate-500 mb-4">Selecciona direcciones exactas y revisa los datos antes de confirmar.</p>
+
             <form onSubmit={handlePedirViaje} className="space-y-4">
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200 space-y-4">
                 {isLoaded ? (
-                  <><div className="relative"><div className="absolute left-4 top-4 w-3 h-3 rounded-full bg-green-500 z-10"></div><Autocomplete onLoad={ref => originRef.current = ref} onPlaceChanged={() => { const p = originRef.current?.getPlace(); if (p?.geometry) { setOrigen(p.formatted_address || p.name); setOrigenCoords({ lat: p.geometry.location.lat(), lng: p.geometry.location.lng() }); } }}><input type="text" placeholder="Punto de Origen (Ej. Reforma 222)" className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm focus:ring-2 focus:ring-orange-500 outline-none" value={origen} onChange={e => setOrigen(e.target.value)} required /></Autocomplete></div><div className="w-px h-6 bg-slate-200 ml-5 -my-2"></div><div className="relative"><div className="absolute left-4 top-4 w-3 h-3 rounded-full bg-orange-500 z-10"></div><Autocomplete onLoad={ref => destRef.current = ref} onPlaceChanged={() => { const p = destRef.current?.getPlace(); if (p?.geometry) { setDestino(p.formatted_address || p.name); setDestinoCoords({ lat: p.geometry.location.lat(), lng: p.geometry.location.lng() }); } }}><input type="text" placeholder="Punto de Destino (Ej. Polanco)" className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm focus:ring-2 focus:ring-orange-500 outline-none" value={destino} onChange={e => setDestino(e.target.value)} required /></Autocomplete></div></>
-                ) : <div className="p-4 text-center text-xs text-slate-400"><Loader2 className="w-5 h-5 animate-spin mx-auto mb-2"/> Cargando mapas...</div>}
+                  <>
+                    <div>
+                        <div className="relative">
+                            <div className="absolute left-4 top-4 w-3 h-3 rounded-full bg-green-500 z-10"></div>
+                            <Autocomplete
+                                onLoad={ref => originRef.current = ref}
+                                onPlaceChanged={() => {
+                                    const place = originRef.current?.getPlace();
+                                    if (place?.geometry) {
+                                        setOrigen(place.formatted_address || place.name || '');
+                                        setOrigenCoords({
+                                            lat: place.geometry.location.lat(),
+                                            lng: place.geometry.location.lng()
+                                        });
+                                    }
+                                }}
+                            >
+                                <input
+                                    type="text"
+                                    placeholder="Punto de origen"
+                                    className="w-full pl-10 pr-11 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm focus:ring-2 focus:ring-orange-500 outline-none"
+                                    value={origen}
+                                    onChange={event => {
+                                        setOrigen(event.target.value);
+                                        setOrigenCoords(null);
+                                    }}
+                                    required
+                                />
+                            </Autocomplete>
+                            {origen && (
+                                <button
+                                    type="button"
+                                    onClick={limpiarOrigen}
+                                    className="absolute right-2 top-2 p-2 text-slate-400 hover:text-red-500 z-20"
+                                    aria-label="Limpiar origen"
+                                >
+                                    <X className="w-5 h-5" />
+                                </button>
+                            )}
+                        </div>
+
+                        {frequentLocations.length > 0 && (
+                            <div className="mt-2">
+                                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">Usar como origen</p>
+                                <div className="flex gap-2 overflow-x-auto pb-1">
+                                    {frequentLocations.map((location, index) => (
+                                        <button
+                                            key={`origin-frequent-${index}-${getFrequentLocationKey(location)}`}
+                                            type="button"
+                                            onClick={() => usarDireccionFrecuente(location, 'origen')}
+                                            className="shrink-0 max-w-[190px] px-3 py-2 rounded-xl bg-green-50 border border-green-100 text-left active:scale-95 transition"
+                                        >
+                                            <p className="text-[10px] font-black text-green-700 truncate">{location.label}</p>
+                                            <p className="text-[9px] text-slate-500 truncate">{location.address}</p>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="w-px h-6 bg-slate-200 ml-5 -my-2"></div>
+
+                    <div>
+                        <div className="relative">
+                            <div className="absolute left-4 top-4 w-3 h-3 rounded-full bg-orange-500 z-10"></div>
+                            <Autocomplete
+                                onLoad={ref => destRef.current = ref}
+                                onPlaceChanged={() => {
+                                    const place = destRef.current?.getPlace();
+                                    if (place?.geometry) {
+                                        setDestino(place.formatted_address || place.name || '');
+                                        setDestinoCoords({
+                                            lat: place.geometry.location.lat(),
+                                            lng: place.geometry.location.lng()
+                                        });
+                                    }
+                                }}
+                            >
+                                <input
+                                    type="text"
+                                    placeholder="Punto de destino"
+                                    className="w-full pl-10 pr-11 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm focus:ring-2 focus:ring-orange-500 outline-none"
+                                    value={destino}
+                                    onChange={event => {
+                                        setDestino(event.target.value);
+                                        setDestinoCoords(null);
+                                    }}
+                                    required
+                                />
+                            </Autocomplete>
+                            {destino && (
+                                <button
+                                    type="button"
+                                    onClick={limpiarDestino}
+                                    className="absolute right-2 top-2 p-2 text-slate-400 hover:text-red-500 z-20"
+                                    aria-label="Limpiar destino"
+                                >
+                                    <X className="w-5 h-5" />
+                                </button>
+                            )}
+                        </div>
+
+                        {frequentLocations.length > 0 && (
+                            <div className="mt-2">
+                                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">Usar como destino</p>
+                                <div className="flex gap-2 overflow-x-auto pb-1">
+                                    {frequentLocations.map((location, index) => (
+                                        <button
+                                            key={`destination-frequent-${index}-${getFrequentLocationKey(location)}`}
+                                            type="button"
+                                            onClick={() => usarDireccionFrecuente(location, 'destino')}
+                                            className="shrink-0 max-w-[190px] px-3 py-2 rounded-xl bg-orange-50 border border-orange-100 text-left active:scale-95 transition"
+                                        >
+                                            <p className="text-[10px] font-black text-orange-700 truncate">{location.label}</p>
+                                            <p className="text-[9px] text-slate-500 truncate">{location.address}</p>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                  </>
+                ) : (
+                  <div className="p-4 text-center text-xs text-slate-400">
+                      <Loader2 className="w-5 h-5 animate-spin mx-auto mb-2" />
+                      Cargando mapas...
+                  </div>
+                )}
               </div>
+
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
                 <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">Tipo de Servicio</p>
-                <div className="grid grid-cols-2 gap-3"><div onClick={() => setTipoServicio('Prioritario')} className={`p-3 rounded-xl border-2 flex flex-col items-center justify-center gap-1 cursor-pointer transition-all ${tipoServicio === 'Prioritario' ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-slate-100 bg-slate-50 text-slate-500'}`}><Zap className="w-6 h-6" /><span className="text-xs font-bold">Lo antes posible</span></div><div onClick={() => setTipoServicio('Programado')} className={`p-3 rounded-xl border-2 flex flex-col items-center justify-center gap-1 cursor-pointer transition-all ${tipoServicio === 'Programado' ? 'border-slate-800 bg-slate-800 text-white' : 'border-slate-100 bg-slate-50 text-slate-500'}`}><Calendar className="w-6 h-6" /><span className="text-xs font-bold">Programar</span></div></div>
-                {tipoServicio === 'Programado' && (<div className="mt-4 grid grid-cols-2 gap-3 animate-[fadeIn_0.2s_ease-out]"><input type="date" className="w-full p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none focus:border-slate-800" value={fecha} onChange={e=>setFecha(e.target.value)} required /><input type="time" className="w-full p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none focus:border-slate-800" value={hora} onChange={e=>setHora(e.target.value)} required /></div>)}
+                <div className="grid grid-cols-2 gap-3">
+                    <button
+                        type="button"
+                        onClick={() => setTipoServicio('Prioritario')}
+                        className={`p-3 rounded-xl border-2 flex flex-col items-center justify-center gap-1 transition-all ${tipoServicio === 'Prioritario' ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-slate-100 bg-slate-50 text-slate-500'}`}
+                    >
+                        <Zap className="w-6 h-6" />
+                        <span className="text-xs font-bold">Lo antes posible</span>
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setTipoServicio('Programado')}
+                        className={`p-3 rounded-xl border-2 flex flex-col items-center justify-center gap-1 transition-all ${tipoServicio === 'Programado' ? 'border-slate-800 bg-slate-800 text-white' : 'border-slate-100 bg-slate-50 text-slate-500'}`}
+                    >
+                        <Calendar className="w-6 h-6" />
+                        <span className="text-xs font-bold">Programar</span>
+                    </button>
+                </div>
+
+                {tipoServicio === 'Programado' && (
+                    <div className="mt-4 grid grid-cols-2 gap-3 animate-[fadeIn_0.2s_ease-out]">
+                        <input
+                            type="date"
+                            className="w-full p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none focus:border-slate-800"
+                            value={fecha}
+                            onChange={event => setFecha(event.target.value)}
+                            required
+                        />
+                        <input
+                            type="time"
+                            className="w-full p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm outline-none focus:border-slate-800"
+                            value={hora}
+                            onChange={event => setHora(event.target.value)}
+                            required
+                        />
+                    </div>
+                )}
               </div>
-              <button type="submit" disabled={loading} className="w-full bg-orange-500 hover:bg-orange-600 text-white font-black p-4 rounded-2xl flex items-center justify-center gap-2 shadow-xl shadow-orange-500/20 active:scale-95 transition-all mt-4">{loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <><CheckCircle className="w-5 h-5"/> SOLICITAR VIAJE</>}</button>
+
+              <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full bg-orange-500 hover:bg-orange-600 text-white font-black p-4 rounded-2xl flex items-center justify-center gap-2 shadow-xl shadow-orange-500/20 active:scale-95 transition-all mt-4 disabled:opacity-60"
+              >
+                  {loading ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                  ) : (
+                      <>
+                          <CheckCircle className="w-5 h-5" />
+                          REVISAR DATOS DEL VIAJE
+                      </>
+                  )}
+              </button>
             </form>
           </div>
         )}
 
-        {/* --- PESTAÑA: HISTORIAL --- */}
+                {/* --- PESTAÑA: HISTORIAL --- */}
         {activeTab === 'historial' && (
           <div className="p-5 animate-[fadeIn_0.3s_ease-out]">
             <h1 className="text-2xl font-black text-slate-800 tracking-tight mb-4">Mis Viajes</h1>
@@ -915,7 +1510,7 @@ export default function App() {
                             <div className={`p-4 flex justify-between items-center text-white ${isArriving ? 'bg-orange-500' : 'bg-slate-800'}`}>
                                 <div className="flex items-center gap-2 font-bold text-sm">
                                     {isArriving ? <BellRing className="w-4 h-4 animate-bounce" /> : <Navigation className="w-4 h-4 animate-pulse" />}
-                                    {viaje.status === 'Pendiente' ? 'ASIGNANDO UNIDAD...' : viaje.status === 'Aceptada' ? 'VIAJE ACEPTADO' : isArriving ? '¡CONDUCTOR LLEGANDO!' : 'VIAJE EN CURSO'}
+                                    {viaje.status === 'Pendiente' ? (viaje.ofertaEstado === 'Pendiente' ? 'CONFIRMANDO CONDUCTOR...' : 'ASIGNANDO UNIDAD...') : viaje.status === 'Aceptada' ? 'VIAJE ACEPTADO' : isArriving ? '¡CONDUCTOR LLEGANDO!' : 'VIAJE EN CURSO'}
                                 </div>
                                 <div className="text-[10px] font-black uppercase bg-black/20 px-2 py-1 rounded-lg">{viaje.serviceType}</div>
                             </div>
@@ -954,7 +1549,7 @@ export default function App() {
                                         </div>
                                         <div className="mt-4 pt-3 border-t border-slate-200 flex items-center gap-3">
                                             <div className="w-10 h-10 bg-slate-200 rounded-full flex items-center justify-center text-slate-500"><User className="w-5 h-5"/></div>
-                                            <div><p className="text-[10px] font-black text-slate-400 uppercase">Operador Asignado</p><p className="text-sm font-bold text-slate-800">{viaje.driver || 'Buscando...'}</p></div>
+                                            <div><p className="text-[10px] font-black text-slate-400 uppercase">Operador Asignado</p><p className="text-sm font-bold text-slate-800">{getTripDriverLabel(viaje)}</p></div>
                                         </div>
                                     </div>
                                 ) : (
@@ -964,7 +1559,7 @@ export default function App() {
                                             <div className="text-right"><p className="text-[10px] font-black uppercase text-orange-500">Llegada en</p><p className="text-xl font-black text-orange-900">{displayDuration} <span className="text-sm">min</span></p></div>
                                         </div>
                                         <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm flex items-center justify-between">
-                                            <div className="flex items-center gap-3"><div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-slate-500"><User className="w-6 h-6"/></div><div><p className="text-[10px] font-black text-slate-400 uppercase">Tu Conductor</p><p className="text-sm font-bold text-slate-800">{viaje.driver || 'Asignando...'}</p>{viaje.driver && <p className="text-[10px] font-bold text-slate-400 mt-0.5">Unidad Estándar</p>}</div></div>
+                                            <div className="flex items-center gap-3"><div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-slate-500"><User className="w-6 h-6"/></div><div><p className="text-[10px] font-black text-slate-400 uppercase">Tu Conductor</p><p className="text-sm font-bold text-slate-800">{getTripDriverLabel(viaje)}</p>{viaje.driver && <p className="text-[10px] font-bold text-slate-400 mt-0.5">Unidad Estándar</p>}</div></div>
                                             <div className="text-right"><p className="text-[10px] font-black text-slate-400 uppercase">Tarifa Est.</p><p className="text-2xl font-black text-slate-800">${costoEstimado}</p></div>
                                         </div>
                                     </div>
