@@ -3,9 +3,9 @@ import {
   MapPin, Clock, Calendar, Zap, ChevronRight, User, 
   Mail, Lock, Loader2, LogOut, PlusCircle, History, 
   Car, ShieldCheck, CheckCircle, Navigation, Phone, 
-  Settings, X, Trash2, BellRing, Briefcase, MessageSquare, Send, CreditCard, CheckCircle2, FileText, Download, Share2, LocateFixed
+  Settings, X, Trash2, BellRing, Briefcase, MessageSquare, Send, CreditCard, CheckCircle2, FileText, Download, Share2
 } from 'lucide-react';
-import { db, setupPushNotifications } from './firebase';
+import { db } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion } from 'firebase/firestore';
 
 // --- GOOGLE MAPS ---
@@ -70,7 +70,6 @@ const getTripDistanceKmForReceipt = (route) => {
         route?.receipt?.distanceKm,
         route?.realDistanceDriven,
         route?.actualDistanceKm,
-        route?.liveNavigation?.distanceKm,
         route?.technicalData?.actualDistance,
         route?.technicalData?.totalDistance
     ];
@@ -672,180 +671,176 @@ const getRemainingWaypointsForClient = (viaje) => {
 };
 
 // =========================================================================
-// MÉTRICAS OFICIALES EN VIVO
-// La app cliente NO vuelve a calcular el ETA durante el viaje. Lee exactamente
-// liveNavigation, que es publicado por la app del conductor.
+// COMPONENTE: MAPA EN VIVO CON RECÁLCULO DE RUTA
 // =========================================================================
-const firstFiniteNumber = (...values) => {
-    for (const value of values) {
-        const number = Number(value);
-        if (Number.isFinite(number) && number >= 0) return number;
-    }
-    return null;
-};
-
-const getAuthoritativeLiveMetrics = (viaje) => {
-    const live = viaje?.liveNavigation || {};
-
-    const liveDistanceKm = firstFiniteNumber(
-        live.distanceKm,
-        live.totalDistanceKm,
-        Number.isFinite(Number(live.distanceMeters)) ? Number(live.distanceMeters) / 1000 : null,
-        Number.isFinite(Number(live.totalDistanceMeters)) ? Number(live.totalDistanceMeters) / 1000 : null
-    );
-
-    const liveDurationMinutes = firstFiniteNumber(
-        live.durationMinutes,
-        live.totalDurationMinutes,
-        Number.isFinite(Number(live.durationSeconds)) ? Number(live.durationSeconds) / 60 : null,
-        Number.isFinite(Number(live.totalDurationSeconds)) ? Number(live.totalDurationSeconds) / 60 : null
-    );
-
-    const fallbackDistance = firstFiniteNumber(
-        viaje?.technicalData?.totalDistance,
-        viaje?.distanceKm
-    );
-
-    const fallbackDuration = firstFiniteNumber(
-        viaje?.technicalData?.totalDuration,
-        viaje?.durationMinutes
-    );
-
-    const nextStopDistanceKm = firstFiniteNumber(
-        live.nextStopDistanceKm,
-        Number.isFinite(Number(live.nextStopDistanceMeters))
-            ? Number(live.nextStopDistanceMeters) / 1000
-            : null
-    );
-
-    const nextStopDurationMinutes = firstFiniteNumber(
-        live.nextStopDurationMinutes,
-        Number.isFinite(Number(live.nextStopDurationSeconds))
-            ? Number(live.nextStopDurationSeconds) / 60
-            : null
-    );
-
-    const hasOfficialLiveData = liveDistanceKm !== null || liveDurationMinutes !== null;
-    const distance = liveDistanceKm ?? fallbackDistance;
-    const duration = liveDurationMinutes ?? fallbackDuration;
-
-    return {
-        totalDistance: distance === null ? '--' : distance.toFixed(1),
-        totalDuration: duration === null ? '--' : Math.max(0, Math.round(duration)),
-        nextStopDistance: nextStopDistanceKm === null ? '' : nextStopDistanceKm.toFixed(1),
-        nextStopDuration: nextStopDurationMinutes === null ? '' : Math.max(0, Math.round(nextStopDurationMinutes)),
-        stopIndex: firstFiniteNumber(live.stopIndex) ?? 0,
-        isLive: hasOfficialLiveData && Boolean(viaje?.currentLocation),
-        source: hasOfficialLiveData ? (live.source || 'conductor') : 'ruta-planificada',
-        updatedAt: live.updatedAt || viaje?.lastUpdate || ''
-    };
-};
-
-const getTrackingPath = (viaje) => {
-    const candidates = [
-        viaje?.liveNavigation?.geometry,
-        viaje?.liveRouteGeometry,
-        viaje?.technicalData?.geometry
-    ];
-
-    for (const candidate of candidates) {
-        const path = normalizePath(candidate);
-        if (path.length > 1) return path;
-    }
-
-    return [];
-};
-
-// =========================================================================
-// COMPONENTE: MAPA EN VIVO SIN RECÁLCULO DUPLICADO
-// =========================================================================
-const LiveTrackingMap = ({
-    viaje,
-    expanded = false,
-    followDriver = true,
-    onMetricsChange
-}) => {
+const LiveTrackingMap = ({ viaje, expanded = false, onMetricsChange }) => {
     const mapRef = useRef(null);
+    const lastRouteRequestRef = useRef(0);
+    const lastRouteOriginRef = useRef(null);
+    const lastRouteSignatureRef = useRef('');
+    const [routePath, setRoutePath] = useState(() => {
+        const livePath = normalizePath(viaje?.liveRouteGeometry);
+        return livePath.length > 0 ? livePath : normalizePath(viaje?.technicalData?.geometry);
+    });
+    const [isRecalculating, setIsRecalculating] = useState(false);
 
     const driverPoint = normalizePoint(viaje?.currentLocation);
     const startPoint = normalizePoint(viaje?.startCoords);
     const endPoint = normalizePoint(viaje?.endCoords);
-    const waypointPoints = (Array.isArray(viaje?.waypointsData) ? viaje.waypointsData : [])
-        .map(normalizePoint)
-        .filter(Boolean);
-    const visiblePath = getTrackingPath(viaje);
+    const plannedPath = normalizePath(viaje?.technicalData?.geometry);
+    const fallbackLivePath = normalizePath(viaje?.liveRouteGeometry);
+    const visiblePath = routePath.length > 0 ? routePath : (fallbackLivePath.length > 0 ? fallbackLivePath : plannedPath);
     const center = driverPoint || startPoint || visiblePath[0] || MAP_CENTER_MX;
-    const metrics = getAuthoritativeLiveMetrics(viaje);
 
-    const adjustMap = useCallback((map) => {
+    const fitRoute = useCallback((map, path, point) => {
         if (!map || !window.google?.maps) return;
 
         try {
-            if (typeof map.setTilt === 'function') map.setTilt(0);
-            if (typeof map.setHeading === 'function') map.setHeading(0);
-
-            if (followDriver && driverPoint) {
-                map.panTo(driverPoint);
-                map.setZoom(expanded ? 17 : 16);
-                return;
-            }
-
-            const points = [
-                ...visiblePath,
-                startPoint,
-                ...waypointPoints,
-                endPoint,
-                driverPoint
-            ].filter(Boolean);
-
-            if (points.length > 1) {
+            if (expanded && path.length > 1) {
                 const bounds = new window.google.maps.LatLngBounds();
-                points.forEach(point => bounds.extend({ lat: point.lat, lng: point.lng }));
-                map.fitBounds(bounds, expanded ? 45 : 30);
+                path.forEach(p => bounds.extend({ lat: p.lat, lng: p.lng }));
+                if (point) bounds.extend({ lat: point.lat, lng: point.lng });
+                map.fitBounds(bounds, 45);
                 return;
             }
 
-            if (points[0]) {
-                map.panTo(points[0]);
-                map.setZoom(15);
+            if (point) {
+                map.panTo(point);
+                map.setZoom(17);
+                return;
             }
-        } catch (error) {
-            console.error('No se pudo ajustar el mapa del cliente:', error);
+
+            if (path.length > 1) {
+                const bounds = new window.google.maps.LatLngBounds();
+                path.forEach(p => bounds.extend({ lat: p.lat, lng: p.lng }));
+                map.fitBounds(bounds, 35);
+            }
+        } catch (e) {
+            console.error('No se pudo ajustar el mapa del cliente:', e);
         }
-    }, [
-        expanded,
-        followDriver,
-        driverPoint?.lat,
-        driverPoint?.lng,
-        startPoint?.lat,
-        startPoint?.lng,
-        endPoint?.lat,
-        endPoint?.lng,
-        visiblePath.length,
-        waypointPoints.length
-    ]);
+    }, [expanded]);
 
     const handleLoad = useCallback((map) => {
         mapRef.current = map;
-        adjustMap(map);
-    }, [adjustMap]);
+        try {
+            if (typeof map.setTilt === 'function') map.setTilt(0);
+            if (typeof map.setHeading === 'function') map.setHeading(0);
+        } catch (e) {}
+        fitRoute(map, visiblePath, driverPoint);
+    }, [fitRoute, visiblePath, driverPoint]);
 
     useEffect(() => {
-        if (mapRef.current) adjustMap(mapRef.current);
-    }, [adjustMap]);
+        if (!mapRef.current) return;
+        fitRoute(mapRef.current, visiblePath, driverPoint);
+    }, [visiblePath, driverPoint, fitRoute]);
 
     useEffect(() => {
-        if (!onMetricsChange || !viaje?.id) return;
-        onMetricsChange(viaje.id, metrics);
+        if (!window.google?.maps || !endPoint) return;
+
+        const origin = driverPoint || startPoint;
+        if (!origin) return;
+
+        const waypointPoints = viaje?.status === 'En Ruta'
+            ? getRemainingWaypointsForClient(viaje)
+            : [];
+
+        const routeSignature = JSON.stringify({
+            id: viaje?.id,
+            status: viaje?.status,
+            dLat: Number(endPoint.lat).toFixed(5),
+            dLng: Number(endPoint.lng).toFixed(5),
+            wp: waypointPoints.map(w => `${Number(w.lat).toFixed(5)},${Number(w.lng).toFixed(5)}`)
+        });
+
+        const now = Date.now();
+        const elapsed = now - lastRouteRequestRef.current;
+        const routeStructureChanged = routeSignature !== lastRouteSignatureRef.current;
+        const movedMeters = lastRouteOriginRef.current
+            ? getDistanceMeters(lastRouteOriginRef.current, origin)
+            : Infinity;
+
+        // Protección para Android WebView:
+        // - nunca dispara solicitudes consecutivas en menos de 8 segundos;
+        // - después recalcula al cambiar paradas/destino, mover 40 m o cada 15 segundos.
+        if (elapsed < 8000) return;
+        if (!routeStructureChanged && movedMeters < 40 && elapsed < 15000) return;
+
+        lastRouteSignatureRef.current = routeSignature;
+        lastRouteOriginRef.current = origin;
+        lastRouteRequestRef.current = now;
+
+        let cancelled = false;
+        setIsRecalculating(true);
+
+        const directionsService = new window.google.maps.DirectionsService();
+
+        directionsService.route({
+            origin: { lat: origin.lat, lng: origin.lng },
+            destination: { lat: endPoint.lat, lng: endPoint.lng },
+            waypoints: waypointPoints.map(p => ({
+                location: { lat: p.lat, lng: p.lng },
+                stopover: true
+            })),
+            optimizeWaypoints: false,
+            travelMode: window.google.maps.TravelMode.DRIVING
+        }, (result, status) => {
+            if (cancelled) return;
+            setIsRecalculating(false);
+
+            if (status !== window.google.maps.DirectionsStatus.OK || !result?.routes?.[0]) {
+                const fallbackDistance = viaje?.technicalData?.totalDistance || '--';
+                const fallbackDuration = viaje?.technicalData?.totalDuration || '--';
+
+                if (onMetricsChange && viaje?.id) {
+                    onMetricsChange(viaje.id, {
+                        totalDistance: fallbackDistance,
+                        totalDuration: fallbackDuration,
+                        isLive: false
+                    });
+                }
+                return;
+            }
+
+            const route = result.routes[0];
+            const dynamicPath = normalizePath(route.overview_path.map(p => ({ lat: p.lat(), lng: p.lng() })));
+
+            let totalDistanceMeters = 0;
+            let totalDurationSeconds = 0;
+
+            route.legs.forEach(leg => {
+                totalDistanceMeters += leg.distance?.value || 0;
+                totalDurationSeconds += leg.duration?.value || 0;
+            });
+
+            const metrics = {
+                totalDistance: (totalDistanceMeters / 1000).toFixed(1),
+                totalDuration: Math.max(1, Math.round(totalDurationSeconds / 60)),
+                nextStopDistance: route.legs?.[0]?.distance?.value ? (route.legs[0].distance.value / 1000).toFixed(1) : '',
+                nextStopDuration: route.legs?.[0]?.duration?.value ? Math.max(1, Math.round(route.legs[0].duration.value / 60)) : '',
+                isLive: Boolean(driverPoint),
+                recalculatedAt: new Date().toISOString()
+            };
+
+            setRoutePath(dynamicPath);
+
+            if (onMetricsChange && viaje?.id) {
+                onMetricsChange(viaje.id, metrics);
+            }
+        });
+
+        return () => {
+            cancelled = true;
+        };
     }, [
         viaje?.id,
-        metrics.totalDistance,
-        metrics.totalDuration,
-        metrics.nextStopDistance,
-        metrics.nextStopDuration,
-        metrics.isLive,
-        metrics.updatedAt,
-        onMetricsChange
+        viaje?.status,
+        viaje?.currentLocation?.lat,
+        viaje?.currentLocation?.lng,
+        viaje?.endCoords?.lat,
+        viaje?.endCoords?.lng,
+        viaje?.startCoords?.lat,
+        viaje?.startCoords?.lng,
+        viaje?.proximityAlert?.stopIndex
     ]);
 
     const driverIcon = getDriverCarIcon();
@@ -855,23 +850,26 @@ const LiveTrackingMap = ({
             <GoogleMap
                 mapContainerStyle={{ width: '100%', height: '100%' }}
                 center={center}
-                zoom={driverPoint ? 16 : 14}
+                zoom={driverPoint ? 17 : 14}
                 onLoad={handleLoad}
                 onUnmount={() => { mapRef.current = null; }}
                 options={{
                     disableDefaultUI: true,
-                    gestureHandling: 'greedy',
-                    backgroundColor: '#e2e8f0',
-                    clickableIcons: false,
-                    keyboardShortcuts: false,
-                    mapTypeControl: false,
-                    fullscreenControl: false,
-                    streetViewControl: false,
-                    rotateControl: false,
-                    tilt: 0,
-                    heading: 0
+                    gestureHandling: "greedy",
+                    backgroundColor: "#e2e8f0"
                 }}
             >
+                {plannedPath.length > 0 && routePath.length > 0 && (
+                    <Polyline
+                        path={plannedPath}
+                        options={{
+                            strokeColor: '#94a3b8',
+                            strokeOpacity: 0.35,
+                            strokeWeight: 4
+                        }}
+                    />
+                )}
+
                 {visiblePath.length > 0 && (
                     <Polyline
                         path={visiblePath}
@@ -883,17 +881,9 @@ const LiveTrackingMap = ({
                     />
                 )}
 
-                {startPoint && <Marker position={startPoint} label="A" />}
-
-                {waypointPoints.map((point, index) => (
-                    <Marker
-                        key={`tracking-waypoint-${index}`}
-                        position={point}
-                        label={String(index + 1)}
-                    />
-                ))}
-
-                {endPoint && <Marker position={endPoint} label="B" />}
+                {startPoint && !driverPoint && (
+                    <Marker position={startPoint} label="A" />
+                )}
 
                 {driverPoint && (
                     <Marker
@@ -902,18 +892,22 @@ const LiveTrackingMap = ({
                         zIndex={999}
                     />
                 )}
+
+                {endPoint && (
+                    <Marker position={endPoint} label="B" />
+                )}
             </GoogleMap>
 
-            <div className="absolute top-3 left-3 bg-white/95 backdrop-blur px-3 py-2 rounded-full shadow-lg border border-slate-200 flex items-center gap-2">
-                <span className={`w-2.5 h-2.5 rounded-full ${metrics.isLive ? 'bg-green-500 animate-pulse' : 'bg-slate-300'}`}></span>
-                <span className="text-[10px] font-black uppercase text-slate-600">
-                    {metrics.isLive ? 'Datos del conductor' : 'Ruta planificada'}
-                </span>
-            </div>
+            {isRecalculating && (
+                <div className="absolute top-3 left-3 bg-white/95 backdrop-blur px-3 py-2 rounded-full shadow-lg border border-slate-200 flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-orange-500" />
+                    <span className="text-[10px] font-black uppercase text-slate-600">Recalculando ruta</span>
+                </div>
+            )}
         </div>
     );
 };
-
+// =========================================================================
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
@@ -937,8 +931,6 @@ export default function App() {
   const [tipoServicio, setTipoServicio] = useState('Prioritario');
   const [fecha, setFecha] = useState('');
   const [hora, setHora] = useState('');
-  const [waypoints, setWaypoints] = useState([]);
-  const [isLocatingOrigin, setIsLocatingOrigin] = useState(false);
   const [frequentLocations, setFrequentLocations] = useState([]);
   const [routeReview, setRouteReview] = useState(null);
   const [isConfirmingTrip, setIsConfirmingTrip] = useState(false);
@@ -948,13 +940,7 @@ export default function App() {
   const [dismissedAlerts, setDismissedAlerts] = useState([]);
   const [activeChatTripId, setActiveChatTripId] = useState(null);
   const [expandedMapTripId, setExpandedMapTripId] = useState(null);
-  const [followExpandedMap, setFollowExpandedMap] = useState(true);
   const [liveTripMetrics, setLiveTripMetrics] = useState({});
-  const [sharedTripId] = useState(() => {
-      try { return new URLSearchParams(window.location.search).get('trip') || ''; } catch (_) { return ''; }
-  });
-  const [sharedTrip, setSharedTrip] = useState(null);
-  const [sharedTripLoading, setSharedTripLoading] = useState(Boolean(sharedTripId));
   const [finishedTripNotice, setFinishedTripNotice] = useState(null);
   const [chatText, setChatText] = useState('');
   const chatScrollRef = useRef(null);
@@ -962,7 +948,6 @@ export default function App() {
   // Ref para detectar cambios y hacer sonar la alerta
   const prevTripsRef = useRef({});
   const reassignmentInProgressRef = useRef(new Set());
-  const tripsUnsubscribeRef = useRef(null);
 
   // --- Billetera ---
   const [clientSecret, setClientSecret] = useState('');
@@ -972,7 +957,6 @@ export default function App() {
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
   const originRef = useRef(null);
   const destRef = useRef(null);
-  const waypointRefs = useRef([]);
 
   const handleLiveMetricsChange = useCallback((tripId, metrics) => {
     if (!tripId || !metrics) return;
@@ -1007,70 +991,6 @@ export default function App() {
     }
   }, []);
 
-
-  useEffect(() => {
-      if (!sharedTripId) return undefined;
-
-      setSharedTripLoading(true);
-      const unsubscribe = onSnapshot(
-          doc(db, 'rutas', sharedTripId),
-          (snapshot) => {
-              setSharedTrip(snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null);
-              setSharedTripLoading(false);
-          },
-          (sharedError) => {
-              console.error('No se pudo abrir el seguimiento compartido:', sharedError);
-              setSharedTrip(null);
-              setSharedTripLoading(false);
-          }
-      );
-
-      return unsubscribe;
-  }, [sharedTripId]);
-
-  useEffect(() => {
-      if (!currentUser?.id) return undefined;
-
-      let disposed = false;
-      let cleanupPush = null;
-
-      const initializePush = async () => {
-          try {
-              cleanupPush = await setupPushNotifications({
-                  onToken: async (token) => {
-                      if (!token || disposed) return;
-                      try {
-                          await updateDoc(doc(db, 'clientes', currentUser.id), {
-                              pushToken: token,
-                              pushPlatform: 'capacitor-fcm',
-                              pushUpdatedAt: new Date().toISOString()
-                          });
-                      } catch (tokenError) {
-                          console.error('No se pudo guardar el token del cliente:', tokenError);
-                      }
-                  },
-                  onNotification: () => {
-                      playAlertSound();
-                      if ('vibrate' in navigator) navigator.vibrate([250, 100, 350]);
-                      setActiveTab('historial');
-                  },
-                  onAction: () => {
-                      setActiveTab('historial');
-                  }
-              });
-          } catch (pushError) {
-              console.warn('Notificaciones no disponibles:', pushError);
-          }
-      };
-
-      initializePush();
-
-      return () => {
-          disposed = true;
-          cleanupPush?.();
-      };
-  }, [currentUser?.id]);
-
   const cargarDatosPerfil = (user) => {
     setName(user.name || ''); setPhone(user.phone || ''); 
     setPassword(user.password || '');
@@ -1085,22 +1005,13 @@ export default function App() {
 
   const escucharMisViajes = (clientName) => {
     if (!clientName) return;
-
-    tripsUnsubscribeRef.current?.();
-
-    const q = query(collection(db, 'rutas'), where('client', '==', clientName));
-    tripsUnsubscribeRef.current = onSnapshot(q, (snapshot) => {
-      const viajes = snapshot.docs.map(item => ({ id: item.id, ...item.data() }));
+    const q = query(collection(db, "rutas"), where("client", "==", clientName));
+    onSnapshot(q, (snapshot) => {
+      const viajes = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       viajes.sort((a, b) => new Date(b.createdDate || 0) - new Date(a.createdDate || 0));
       setMisViajes(viajes);
-    }, (snapshotError) => {
-      console.error('No se pudieron escuchar los viajes:', snapshotError);
     });
   };
-
-  useEffect(() => () => {
-      tripsUnsubscribeRef.current?.();
-  }, []);
 
 
   const obtenerConductorDisponible = useCallback(async (originPoint, excludedDriverIds = []) => {
@@ -1195,122 +1106,6 @@ export default function App() {
   const limpiarDestino = () => {
       setDestino('');
       setDestinoCoords(null);
-  };
-
-
-  const agregarParada = () => {
-      setWaypoints(prev => {
-          if (prev.length >= 5) {
-              alert('Puedes agregar hasta 5 puntos intermedios.');
-              return prev;
-          }
-
-          return [
-              ...prev,
-              {
-                  id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                  address: '',
-                  coords: null
-              }
-          ];
-      });
-  };
-
-  const actualizarParada = (index, changes) => {
-      setWaypoints(prev => prev.map((waypoint, waypointIndex) => (
-          waypointIndex === index ? { ...waypoint, ...changes } : waypoint
-      )));
-  };
-
-  const eliminarParada = (index) => {
-      setWaypoints(prev => prev.filter((_, waypointIndex) => waypointIndex !== index));
-  };
-
-  const usarUbicacionActualComoOrigen = () => {
-      if (!('geolocation' in navigator)) {
-          alert('Este dispositivo no permite obtener la ubicación actual.');
-          return;
-      }
-
-      setIsLocatingOrigin(true);
-
-      navigator.geolocation.getCurrentPosition(
-          async (position) => {
-              const coords = {
-                  lat: position.coords.latitude,
-                  lng: position.coords.longitude
-              };
-
-              setOrigenCoords(coords);
-
-              try {
-                  if (window.google?.maps?.Geocoder) {
-                      const geocoder = new window.google.maps.Geocoder();
-                      const response = await geocoder.geocode({ location: coords });
-                      const address = response?.results?.[0]?.formatted_address;
-                      setOrigen(address || 'Ubicación actual');
-                  } else {
-                      setOrigen('Ubicación actual');
-                  }
-              } catch (geocoderError) {
-                  console.warn('No se pudo obtener la dirección:', geocoderError);
-                  setOrigen('Ubicación actual');
-              } finally {
-                  setIsLocatingOrigin(false);
-              }
-          },
-          (locationError) => {
-              console.error('No se pudo obtener la ubicación:', locationError);
-              setIsLocatingOrigin(false);
-              alert('Activa la ubicación precisa y vuelve a intentarlo.');
-          },
-          {
-              enableHighAccuracy: true,
-              timeout: 15000,
-              maximumAge: 15000
-          }
-      );
-  };
-
-  const compartirSeguimiento = async (viaje) => {
-      if (!viaje?.id) return;
-
-      const configuredBase = String(import.meta.env.VITE_PUBLIC_APP_URL || 'https://app-angel-three.vercel.app')
-          .trim()
-          .replace(/\/$/, '');
-
-      const runtimeBase = (
-          /^https?:$/.test(window.location.protocol) &&
-          !['localhost', '127.0.0.1'].includes(window.location.hostname)
-      ) ? window.location.origin : '';
-
-      const baseUrl = configuredBase || runtimeBase;
-
-      if (!baseUrl) {
-          alert('Para compartir desde la APK agrega VITE_PUBLIC_APP_URL con la URL pública de Vercel y vuelve a compilar.');
-          return;
-      }
-
-      const url = `${baseUrl}/?trip=${encodeURIComponent(viaje.id)}`;
-      const shareData = {
-          title: 'Seguimiento TripLogix',
-          text: `Sigue en tiempo real el viaje de ${viaje.client || 'TripLogix'}.`,
-          url
-      };
-
-      try {
-          if (navigator.share) {
-              await navigator.share(shareData);
-              return;
-          }
-
-          await navigator.clipboard.writeText(url);
-          alert('Enlace de seguimiento copiado.');
-      } catch (shareError) {
-          if (shareError?.name === 'AbortError') return;
-          console.error('No se pudo compartir el seguimiento:', shareError);
-          window.prompt('Copia este enlace de seguimiento:', url);
-      }
   };
 
   // Reasignación automática cuando un conductor rechaza la oferta.
@@ -1473,14 +1268,8 @@ export default function App() {
 
     if (!origen || !destino) return alert('Ingresa origen y destino');
     if (!origenCoords || !destinoCoords) {
-        return alert('Selecciona origen y destino desde las sugerencias de Google Maps, tus direcciones frecuentes o tu ubicación actual.');
+        return alert('Selecciona ambas direcciones desde las sugerencias de Google Maps o desde tus direcciones frecuentes.');
     }
-
-    const invalidWaypoint = waypoints.find(waypoint => !waypoint.address || !waypoint.coords);
-    if (invalidWaypoint) {
-        return alert('Selecciona cada punto intermedio desde las sugerencias de Google Maps o elimina el que esté vacío.');
-    }
-
     if (tipoServicio === 'Programado' && (!fecha || !hora)) {
         return alert('Ingresa fecha y hora para programar');
     }
@@ -1495,27 +1284,20 @@ export default function App() {
       const results = await directionsService.route({
           origin: origenCoords,
           destination: destinoCoords,
-          waypoints: waypoints.map(waypoint => ({
-              location: waypoint.coords,
-              stopover: true
-          })),
-          optimizeWaypoints: false,
           travelMode: window.google.maps.TravelMode.DRIVING,
       });
 
       const routeData = results?.routes?.[0];
-      const legs = routeData?.legs || [];
+      const firstLeg = routeData?.legs?.[0];
 
-      if (!routeData || legs.length === 0) {
+      if (!routeData || !firstLeg) {
           throw new Error('Google Maps no devolvió una ruta válida.');
       }
 
-      const distanceValue = legs.reduce((total, leg) => total + (leg.distance?.value || 0), 0);
-      const durationValue = legs.reduce((total, leg) => total + (leg.duration?.value || 0), 0);
+      const distanceValue = firstLeg.distance?.value || 0;
+      const durationValue = firstLeg.duration?.value || 0;
       const distanceKm = (distanceValue / 1000).toFixed(1);
       const durationMin = Math.max(1, Math.round(durationValue / 60));
-      const firstLegDistanceKm = ((legs[0]?.distance?.value || 0) / 1000).toFixed(1);
-      const firstLegDurationMin = Math.max(1, Math.round((legs[0]?.duration?.value || 0) / 60));
       const geometry = routeData.overview_path.map(point => ({
           lat: point.lat(),
           lng: point.lng()
@@ -1537,17 +1319,6 @@ export default function App() {
           technicalData: { totalDistance: distanceKm, totalDuration: durationMin }
       });
       const estimatedCost = estimatedPricing.total.toFixed(2);
-      const nowIso = new Date().toISOString();
-
-      const waypointAddresses = waypoints.map(waypoint => waypoint.address);
-      const waypointData = waypoints.map((waypoint, index) => ({
-          lat: waypoint.coords.lat,
-          lng: waypoint.coords.lng,
-          address: waypoint.address,
-          label: `Parada ${index + 1}`,
-          passengerName: currentUser.name,
-          contact: currentUser.phone
-      }));
 
       const routePayload = {
         client: currentUser.name || 'Cliente',
@@ -1571,27 +1342,18 @@ export default function App() {
         scheduledDate,
         scheduledTime,
         status: 'Pendiente',
-        createdDate: nowIso,
+        createdDate: new Date().toISOString(),
         driverId: '',
         driver: '',
-        waypoints: waypointAddresses,
-        waypointsData: waypointData,
+        waypoints: [],
+        waypointsData: [],
         chat: [],
         assignmentStatus: 'Preparando asignación',
         assignmentTriedDriverIds: [],
         pricing: {
             ...estimatedPricing,
-            estimatedAt: nowIso,
+            estimatedAt: new Date().toISOString(),
             model: 'TripLogix base + distancia + tiempo + cuota operativa'
-        },
-        liveNavigation: {
-            distanceKm: Number(distanceKm),
-            durationMinutes: durationMin,
-            nextStopDistanceKm: Number(firstLegDistanceKm),
-            nextStopDurationMinutes: firstLegDurationMin,
-            stopIndex: 0,
-            source: 'client-planned',
-            updatedAt: nowIso
         },
         technicalData: {
             totalDistance: distanceKm,
@@ -1600,6 +1362,8 @@ export default function App() {
         }
       };
 
+      // No guardamos todavía. Primero se muestra un resumen para que el usuario
+      // confirme o regrese a corregir cualquier dirección.
       setRouteReview({
           routePayload,
           distanceKm,
@@ -1610,7 +1374,7 @@ export default function App() {
       });
     } catch (err) {
         console.error(err);
-        alert('Error calculando la ruta. Verifica tu conexión, las paradas o intenta con otra dirección.');
+        alert('Error calculando la ruta. Verifica tu conexión o intenta con otra dirección.');
     } finally {
         setLoading(false);
     }
@@ -1678,7 +1442,6 @@ export default function App() {
           setRouteReview(null);
           limpiarOrigen();
           limpiarDestino();
-          setWaypoints([]);
           setFecha('');
           setHora('');
           setActiveTab('historial');
@@ -1722,66 +1485,6 @@ export default function App() {
       }
       setIniciandoStripe(false);
   };
-
-  if (sharedTripId) {
-      const sharedMetrics = sharedTrip ? getAuthoritativeLiveMetrics(sharedTrip) : null;
-
-      return (
-          <div className="min-h-screen bg-slate-950 font-sans flex flex-col">
-              <div className="bg-slate-900 text-white p-5 shadow-lg">
-                  <p className="text-[10px] font-black uppercase tracking-widest text-orange-400">TripLogix · Seguimiento compartido</p>
-                  <h1 className="text-xl font-black mt-1">
-                      {sharedTrip?.status === 'Finalizado' ? 'Viaje finalizado' : 'Viaje en tiempo real'}
-                  </h1>
-                  <p className="text-xs text-slate-400 mt-1 line-clamp-1">
-                      {sharedTrip?.end || 'Cargando información del viaje...'}
-                  </p>
-              </div>
-
-              <div className="flex-1 min-h-[55vh] relative">
-                  {sharedTripLoading || !isLoaded ? (
-                      <div className="absolute inset-0 flex items-center justify-center text-white">
-                          <Loader2 className="w-8 h-8 animate-spin text-orange-500" />
-                      </div>
-                  ) : sharedTrip ? (
-                      <LiveTrackingMap
-                          viaje={sharedTrip}
-                          expanded={true}
-                          followDriver={sharedTrip.status === 'En Ruta'}
-                          onMetricsChange={handleLiveMetricsChange}
-                      />
-                  ) : (
-                      <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-white">
-                          <div>
-                              <X className="w-12 h-12 mx-auto text-red-400 mb-3" />
-                              <p className="font-black">El viaje no existe o ya no está disponible.</p>
-                          </div>
-                      </div>
-                  )}
-              </div>
-
-              {sharedTrip && (
-                  <div className="bg-white p-5 rounded-t-[2rem] shadow-2xl">
-                      <div className="grid grid-cols-2 gap-3">
-                          <div className="bg-orange-50 border border-orange-100 rounded-2xl p-4">
-                              <p className="text-[10px] font-black uppercase text-orange-500">Distancia restante</p>
-                              <p className="text-2xl font-black text-orange-900">{sharedMetrics?.totalDistance || '--'} <span className="text-sm">km</span></p>
-                          </div>
-                          <div className="bg-green-50 border border-green-100 rounded-2xl p-4 text-right">
-                              <p className="text-[10px] font-black uppercase text-green-600">Llegada en</p>
-                              <p className="text-2xl font-black text-green-800">{sharedMetrics?.totalDuration || '--'} <span className="text-sm">min</span></p>
-                          </div>
-                      </div>
-                      <div className="mt-3 bg-slate-50 border border-slate-200 rounded-2xl p-4">
-                          <p className="text-[10px] font-black uppercase text-slate-400">Estado</p>
-                          <p className="font-black text-slate-800">{sharedTrip.status || 'Pendiente'}</p>
-                          <p className="text-xs text-slate-500 mt-1">Conductor: {getTripDriverLabel(sharedTrip)}</p>
-                      </div>
-                  </div>
-              )}
-          </div>
-      );
-  }
 
   if (!currentUser) {
     return (
@@ -1901,18 +1604,6 @@ export default function App() {
                                   <p className="text-sm font-bold text-slate-800 mt-1">{routeReview.routePayload.start}</p>
                               </div>
                           </div>
-                          {routeReview.routePayload.waypointsData?.map((waypoint, index) => (
-                              <React.Fragment key={`review-waypoint-${index}`}>
-                                  <div className="ml-1.5 h-5 border-l-2 border-dashed border-slate-200"></div>
-                                  <div className="flex gap-3">
-                                      <div className="mt-1 w-3 h-3 rounded-full bg-blue-500 shrink-0"></div>
-                                      <div>
-                                          <p className="text-[10px] font-black uppercase text-slate-400">Parada {index + 1}</p>
-                                          <p className="text-sm font-bold text-slate-800 mt-1">{waypoint.address}</p>
-                                      </div>
-                                  </div>
-                              </React.Fragment>
-                          ))}
                           <div className="ml-1.5 h-5 border-l-2 border-dashed border-slate-200"></div>
                           <div className="flex gap-3">
                               <div className="mt-1 w-3 h-3 rounded-full bg-orange-500 shrink-0"></div>
@@ -1995,7 +1686,6 @@ export default function App() {
                       <LiveTrackingMap
                           viaje={expandedMapTrip}
                           expanded={true}
-                          followDriver={followExpandedMap}
                           onMetricsChange={handleLiveMetricsChange}
                       />
                   ) : (
@@ -2010,29 +1700,19 @@ export default function App() {
                       <div className="bg-orange-50 border border-orange-100 rounded-2xl p-4">
                           <p className="text-[10px] font-black uppercase text-orange-500">Distancia restante</p>
                           <p className="text-2xl font-black text-orange-900">
-                              {getAuthoritativeLiveMetrics(expandedMapTrip).totalDistance} <span className="text-sm">km</span>
+                              {getSafeMetric(liveTripMetrics[expandedMapTrip.id]?.totalDistance || expandedMapTrip.technicalData?.totalDistance)} <span className="text-sm">km</span>
                           </p>
                       </div>
                       <div className="bg-green-50 border border-green-100 rounded-2xl p-4 text-right">
                           <p className="text-[10px] font-black uppercase text-green-600">Llegada en</p>
                           <p className="text-2xl font-black text-green-700">
-                              {getAuthoritativeLiveMetrics(expandedMapTrip).totalDuration} <span className="text-sm">min</span>
+                              {getSafeMetric(liveTripMetrics[expandedMapTrip.id]?.totalDuration || expandedMapTrip.technicalData?.totalDuration)} <span className="text-sm">min</span>
                           </p>
                       </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-3 mt-3">
-                      <button
-                          type="button"
-                          onClick={() => setFollowExpandedMap(prev => !prev)}
-                          className="bg-orange-50 border border-orange-200 text-orange-700 font-black p-3.5 rounded-2xl active:scale-95 transition flex items-center justify-center gap-2 text-xs"
-                      >
-                          <LocateFixed className="w-4 h-4" />
-                          {followExpandedMap ? 'VER RUTA' : 'SEGUIR AUTO'}
-                      </button>
-                      <button onClick={() => setExpandedMapTripId(null)} className="bg-slate-800 text-white font-black p-3.5 rounded-2xl active:scale-95 transition text-xs">
-                          CERRAR MAPA
-                      </button>
-                  </div>
+                  <button onClick={() => setExpandedMapTripId(null)} className="w-full mt-3 bg-slate-800 text-white font-black p-3.5 rounded-2xl active:scale-95 transition">
+                      CERRAR MAPA
+                  </button>
               </div>
           </div>
       )}
@@ -2105,7 +1785,7 @@ export default function App() {
           </div>
           <div><p className={`text-[10px] font-bold uppercase tracking-widest flex items-center gap-1 ${isCorporate ? 'text-slate-800' : 'text-slate-400'}`}>{isCorporate ? <><Briefcase className="w-3 h-3"/> Corporativo</> : <><User className="w-3 h-3"/> Cliente</>}</p><h2 className="text-sm font-black text-slate-800 leading-tight">{currentUser?.name || 'Usuario'}</h2></div>
         </div>
-        <button onClick={() => { tripsUnsubscribeRef.current?.(); localStorage.removeItem('client_session'); setCurrentUser(null); }} className="p-2 bg-slate-50 text-slate-500 hover:text-red-500 rounded-full transition"><LogOut className="w-5 h-5" /></button>
+        <button onClick={() => { localStorage.removeItem('client_session'); setCurrentUser(null); }} className="p-2 bg-slate-50 text-slate-500 hover:text-red-500 rounded-full transition"><LogOut className="w-5 h-5" /></button>
       </div>
 
       <div className="flex-1 overflow-y-auto pb-24">
@@ -2160,16 +1840,6 @@ export default function App() {
                             )}
                         </div>
 
-                        <button
-                            type="button"
-                            onClick={usarUbicacionActualComoOrigen}
-                            disabled={isLocatingOrigin}
-                            className="mt-2 w-full px-3 py-2.5 rounded-xl bg-blue-50 border border-blue-100 text-blue-700 font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-2 disabled:opacity-60"
-                        >
-                            {isLocatingOrigin ? <Loader2 className="w-4 h-4 animate-spin" /> : <LocateFixed className="w-4 h-4" />}
-                            Usar mi ubicación actual
-                        </button>
-
                         {frequentLocations.length > 0 && (
                             <div className="mt-2">
                                 <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">Usar como origen</p>
@@ -2189,62 +1859,6 @@ export default function App() {
                             </div>
                         )}
                     </div>
-
-                    {waypoints.map((waypoint, index) => (
-                        <React.Fragment key={waypoint.id}>
-                            <div className="w-px h-5 bg-slate-200 ml-5 -my-2"></div>
-                            <div className="relative">
-                                <div className="absolute left-4 top-4 w-5 h-5 -translate-y-1 rounded-full bg-blue-500 text-white text-[9px] font-black flex items-center justify-center z-10">
-                                    {index + 1}
-                                </div>
-                                <Autocomplete
-                                    onLoad={ref => { waypointRefs.current[index] = ref; }}
-                                    onPlaceChanged={() => {
-                                        const place = waypointRefs.current[index]?.getPlace();
-                                        if (place?.geometry) {
-                                            actualizarParada(index, {
-                                                address: place.formatted_address || place.name || '',
-                                                coords: {
-                                                    lat: place.geometry.location.lat(),
-                                                    lng: place.geometry.location.lng()
-                                                }
-                                            });
-                                        }
-                                    }}
-                                >
-                                    <input
-                                        type="text"
-                                        placeholder={`Punto intermedio ${index + 1}`}
-                                        className="w-full pl-11 pr-11 p-3 rounded-xl bg-blue-50/50 border border-blue-100 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-                                        value={waypoint.address}
-                                        onChange={event => actualizarParada(index, {
-                                            address: event.target.value,
-                                            coords: null
-                                        })}
-                                        required
-                                    />
-                                </Autocomplete>
-                                <button
-                                    type="button"
-                                    onClick={() => eliminarParada(index)}
-                                    className="absolute right-2 top-2 p-2 text-slate-400 hover:text-red-500 z-20"
-                                    aria-label={`Eliminar parada ${index + 1}`}
-                                >
-                                    <Trash2 className="w-5 h-5" />
-                                </button>
-                            </div>
-                        </React.Fragment>
-                    ))}
-
-                    <button
-                        type="button"
-                        onClick={agregarParada}
-                        disabled={waypoints.length >= 5}
-                        className="w-full p-3 rounded-xl border-2 border-dashed border-blue-200 bg-blue-50/40 text-blue-700 font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-2 disabled:opacity-40"
-                    >
-                        <PlusCircle className="w-4 h-4" />
-                        Agregar punto intermedio opcional
-                    </button>
 
                     <div className="w-px h-6 bg-slate-200 ml-5 -my-2"></div>
 
@@ -2385,9 +1999,14 @@ export default function App() {
               <div className="space-y-6">
                 {activeTrips.map(viaje => {
                     const isArriving = viaje.status === 'En Ruta' && viaje.proximityAlert?.active;
-                    const authoritativeMetrics = getAuthoritativeLiveMetrics(viaje);
-                    const displayDistance = authoritativeMetrics.totalDistance;
-                    const displayDuration = authoritativeMetrics.totalDuration;
+                    const liveMetrics = liveTripMetrics[viaje.id] || {};
+                    const displayDistance = viaje.status === 'En Ruta'
+                        ? (liveMetrics.totalDistance || viaje.technicalData?.totalDistance || '--')
+                        : (viaje.technicalData?.totalDistance || '--');
+                    const displayDuration = viaje.status === 'En Ruta'
+                        ? (liveMetrics.totalDuration || viaje.technicalData?.totalDuration || '--')
+                        : (viaje.technicalData?.totalDuration || '--');
+                    const distanciaKm = parseFloat(displayDistance) || parseFloat(viaje.technicalData?.totalDistance) || 0;
                     const costoEstimado = calculateTripLogixFare(viaje).total.toFixed(2); 
 
                     return (
@@ -2411,7 +2030,7 @@ export default function App() {
                                 )}
                                 <button
                                     type="button"
-                                    onClick={() => { setFollowExpandedMap(true); setExpandedMapTripId(viaje.id); }}
+                                    onClick={() => setExpandedMapTripId(viaje.id)}
                                     className="absolute top-3 right-3 bg-white/95 backdrop-blur text-slate-800 border border-slate-200 shadow-lg rounded-full px-3 py-2 text-[10px] font-black uppercase tracking-widest active:scale-95 transition"
                                 >
                                     Expandir
@@ -2449,13 +2068,6 @@ export default function App() {
                                         </div>
                                     </div>
                                 )}
-                                <button
-                                    type="button"
-                                    onClick={() => compartirSeguimiento(viaje)}
-                                    className="w-full mt-4 bg-orange-50 hover:bg-orange-100 text-orange-700 border border-orange-200 font-black p-3.5 rounded-xl text-xs flex items-center justify-center gap-2 transition-colors"
-                                >
-                                    <Share2 className="w-4 h-4" /> COMPARTIR SEGUIMIENTO
-                                </button>
                                 {viaje.driver && viaje.status === 'En Ruta' && (
                                     <button onClick={() => setActiveChatTripId(viaje.id)} className="w-full mt-4 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 font-black p-3.5 rounded-xl text-xs flex items-center justify-center gap-2 transition-colors relative"><MessageSquare className="w-4 h-4"/> CHATEAR CON EL CONDUCTOR {viaje.chat && viaje.chat.length > 0 && viaje.chat[viaje.chat.length-1].sender !== 'Cliente' && <span className="absolute top-2 right-2 w-3 h-3 bg-red-500 rounded-full border-2 border-slate-100 animate-pulse"></span>}</button>
                                 )}
