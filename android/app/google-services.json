@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "779301031888",
+    "project_id": "sistema-transporte-dec9d",
+    "storage_bucket": "sistema-transporte-dec9d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:779301031888:android:d6c5219ca89cd17927b3d5",
+        "android_client_info": {
+          "package_name": "com.example.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCKcEUNE2pBOas52pUt1FvX3lt_CM7ClAU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:779301031888:android:09b6a767b1dd87df27b3d5",
+        "android_client_info": {
+          "package_name": "com.triplogix.cliente"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCKcEUNE2pBOas52pUt1FvX3lt_CM7ClAU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
