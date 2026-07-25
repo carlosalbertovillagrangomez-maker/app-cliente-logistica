@@ -7,6 +7,9 @@ import {
 } from 'lucide-react';
 import { db, setupPushNotifications } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion } from 'firebase/firestore';
+import { Capacitor } from '@capacitor/core';
+import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
 
 // --- GOOGLE MAPS ---
 import { GoogleMap, useJsApiLoader, Autocomplete, Marker, Polyline } from '@react-google-maps/api';
@@ -17,6 +20,7 @@ import { Elements, CardElement, useStripe, useElements } from '@stripe/react-str
 import { jsPDF } from 'jspdf';
 
 const GOOGLE_MAPS_API_KEY = "AIzaSyA-t6YcuPK1PdOoHZJOyOsw6PK0tCDJrn0"; 
+const GOOGLE_VECTOR_MAP_ID = "73f56298887c80075f6fc648";
 const libraries = ['places', 'geometry'];
 
 // INICIALIZAR STRIPE CON TU LLAVE PÚBLICA
@@ -31,6 +35,82 @@ const playAlertSound = () => {
         audio.play().catch(e => console.log("Navegador bloqueó el audio automático"));
     } catch(e) {}
 };
+
+class TripLogixClientErrorBoundary extends React.Component {
+    constructor(props) {
+        super(props);
+        this.state = {
+            hasError: false,
+            message: ''
+        };
+    }
+
+    static getDerivedStateFromError(error) {
+        return {
+            hasError: true,
+            message: error?.message || 'Se produjo un error inesperado.'
+        };
+    }
+
+    componentDidCatch(error, errorInfo) {
+        console.error('TripLogix Client render error:', error, errorInfo);
+
+        try {
+            localStorage.setItem(
+                'triplogix_last_client_error',
+                JSON.stringify({
+                    message: error?.message || String(error),
+                    stack: error?.stack || '',
+                    componentStack: errorInfo?.componentStack || '',
+                    createdAt: new Date().toISOString()
+                })
+            );
+        } catch (_) {}
+    }
+
+    recoverApp = () => {
+        window.location.reload();
+    };
+
+    render() {
+        if (!this.state.hasError) return this.props.children;
+
+        return (
+            <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6 font-sans">
+                <div className="w-full max-w-sm bg-white text-slate-800 rounded-[2rem] p-6 shadow-2xl border-4 border-orange-500">
+                    <div className="w-14 h-14 mx-auto rounded-2xl bg-orange-100 text-orange-600 flex items-center justify-center mb-4">
+                        <ShieldCheck className="w-8 h-8" />
+                    </div>
+
+                    <h1 className="text-xl font-black text-center">
+                        TripLogix se protegió de un error
+                    </h1>
+
+                    <p className="text-sm text-slate-500 text-center mt-2">
+                        La aplicación evitó quedarse completamente en blanco.
+                    </p>
+
+                    <div className="mt-4 p-3 rounded-xl bg-slate-100 border border-slate-200">
+                        <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+                            Detalle técnico
+                        </p>
+                        <p className="text-xs text-slate-700 mt-1 break-words">
+                            {this.state.message}
+                        </p>
+                    </div>
+
+                    <button
+                        type="button"
+                        onClick={this.recoverApp}
+                        className="w-full mt-5 py-4 rounded-2xl bg-orange-500 text-white font-black uppercase tracking-widest text-xs"
+                    >
+                        Recargar aplicación
+                    </button>
+                </div>
+            </div>
+        );
+    }
+}
 
 
 // =========================================================================
@@ -70,6 +150,8 @@ const getTripDistanceKmForReceipt = (route) => {
         route?.receipt?.distanceKm,
         route?.realDistanceDriven,
         route?.actualDistanceKm,
+        route?.finalDistanceKm,
+        route?.pricing?.distanceKm,
         route?.liveNavigation?.distanceKm,
         route?.technicalData?.actualDistance,
         route?.technicalData?.totalDistance
@@ -104,6 +186,8 @@ const getTripDurationMinutesForReceipt = (route, forcedEndTimestamp = null) => {
     const candidates = [
         route?.receipt?.durationMinutes,
         route?.actualDurationMinutes,
+        route?.finalDurationMinutes,
+        route?.pricing?.durationMinutes,
         route?.technicalData?.actualDuration,
         route?.technicalData?.totalDuration
     ];
@@ -415,39 +499,101 @@ const createTripLogixReceiptPdf = (route) => {
     return { pdf, receipt };
 };
 
-const downloadTripLogixReceiptPdf = (route) => {
-    const { pdf, receipt } = createTripLogixReceiptPdf(route);
-    pdf.save(`TripLogix_Recibo_${receipt.folio}.pdf`);
+const writeTripLogixPdfToNativeCache = async (pdf, filename) => {
+    const dataUri = String(pdf.output('datauristring') || '');
+    const base64Data = dataUri.includes(',') ? dataUri.split(',')[1] : '';
+
+    if (!base64Data) {
+        throw new Error('No fue posible convertir el recibo PDF.');
+    }
+
+    await Filesystem.writeFile({
+        path: filename,
+        data: base64Data,
+        directory: Directory.Cache,
+        recursive: true
+    });
+
+    const uriResult = await Filesystem.getUri({
+        path: filename,
+        directory: Directory.Cache
+    });
+
+    return uriResult.uri;
 };
 
-const shareTripLogixReceiptPdf = async (route) => {
-    const { pdf, receipt } = createTripLogixReceiptPdf(route);
-    const blob = pdf.output('blob');
-    const filename = `TripLogix_Recibo_${receipt.folio}.pdf`;
-
+const downloadTripLogixReceiptPdf = async (route) => {
     try {
-        const file = new File([blob], filename, { type: 'application/pdf' });
-        if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-            await navigator.share({
+        const { pdf, receipt } = createTripLogixReceiptPdf(route);
+        const filename = `TripLogix_Recibo_${receipt.folio}.pdf`;
+
+        if (Capacitor.isNativePlatform()) {
+            const fileUri = await writeTripLogixPdfToNativeCache(pdf, filename);
+
+            await Share.share({
                 title: `Recibo TripLogix ${receipt.folio}`,
-                text: `Comprobante oficial de viaje TripLogix ${receipt.folio}`,
-                files: [file]
+                text: 'Abre, guarda o envía tu comprobante oficial de viaje.',
+                files: [fileUri],
+                dialogTitle: 'Guardar recibo PDF'
             });
             return;
         }
+
+        pdf.save(filename);
     } catch (error) {
         if (error?.name === 'AbortError') return;
-        console.warn('No se pudo compartir directamente el PDF:', error);
+        console.error('No se pudo generar el recibo PDF:', error);
+        alert('No se pudo generar el recibo PDF. Vuelve a intentarlo.');
     }
+};
 
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+const shareTripLogixReceiptPdf = async (route) => {
+    try {
+        const { pdf, receipt } = createTripLogixReceiptPdf(route);
+        const filename = `TripLogix_Recibo_${receipt.folio}.pdf`;
+
+        if (Capacitor.isNativePlatform()) {
+            const fileUri = await writeTripLogixPdfToNativeCache(pdf, filename);
+
+            await Share.share({
+                title: `Recibo TripLogix ${receipt.folio}`,
+                text: `Comprobante oficial de viaje TripLogix ${receipt.folio}`,
+                files: [fileUri],
+                dialogTitle: 'Compartir recibo'
+            });
+            return;
+        }
+
+        const blob = pdf.output('blob');
+
+        try {
+            const file = new File([blob], filename, { type: 'application/pdf' });
+            if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+                await navigator.share({
+                    title: `Recibo TripLogix ${receipt.folio}`,
+                    text: `Comprobante oficial de viaje TripLogix ${receipt.folio}`,
+                    files: [file]
+                });
+                return;
+            }
+        } catch (webShareError) {
+            if (webShareError?.name === 'AbortError') return;
+            console.warn('No se pudo compartir directamente el PDF:', webShareError);
+        }
+
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+    } catch (error) {
+        if (error?.name === 'AbortError') return;
+        console.error('No se pudo compartir el recibo PDF:', error);
+        alert('No se pudo compartir el recibo PDF. Vuelve a intentarlo.');
+    }
 };
 
 
@@ -561,6 +707,78 @@ const getSafeMetric = (value, fallback = '--') => {
 };
 
 
+const normalizeHeadingDegrees = (value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 0;
+    return ((number % 360) + 360) % 360;
+};
+
+const getHeadingDifference = (from, to) => {
+    const a = normalizeHeadingDegrees(from);
+    const b = normalizeHeadingDegrees(to);
+    return Math.abs(((b - a + 540) % 360) - 180);
+};
+
+const isDispatcherScheduledTrip = (route) => {
+    if (!route) return false;
+
+    return Boolean(
+        route?.pricingVisibility === 'hidden_during_trip' ||
+        route?.showPricingDuringTrip === false ||
+        route?.tripSource === 'dispatcher' ||
+        route?.createdBy === 'dispatcher' ||
+        route?.pricingPolicy === 'dispatcher_hidden_during_trip' ||
+        route?.officialScheduledTime ||
+        route?.technicalData?.carpool
+    );
+};
+
+const shouldHideTripPricingDuringActive = (route) => {
+    return isDispatcherScheduledTrip(route) && route?.status !== 'Finalizado';
+};
+
+const getDriverPublishedPricing = (route) => {
+    if (shouldHideTripPricingDuringActive(route)) {
+        return {
+            available: false,
+            hidden: true,
+            currency: 'MXN',
+            total: null,
+            source: 'Tarifa administrada por despacho',
+            updatedAt: ''
+        };
+    }
+
+    const pricing = route?.pricing && typeof route.pricing === 'object'
+        ? route.pricing
+        : null;
+
+    const total = Number(pricing?.total);
+    const isDriverPricing = String(pricing?.source || '').startsWith('driver-');
+
+    if (!pricing || !Number.isFinite(total) || total < 0) {
+        return {
+            available: false,
+            currency: 'MXN',
+            total: null,
+            source: 'Pendiente de cálculo del conductor',
+            updatedAt: ''
+        };
+    }
+
+    return {
+        ...pricing,
+        available: true,
+        total,
+        currency: pricing.currency || 'MXN',
+        source: isDriverPricing
+            ? 'Tarifa calculada por el conductor'
+            : 'Tarifa registrada',
+        updatedAt: pricing.updatedAt || pricing.estimatedAt || ''
+    };
+};
+
+
 const normalizeFrequentLocation = (location, index = 0) => {
     if (!location || typeof location === 'string') return null;
 
@@ -619,6 +837,152 @@ const getTripDriverLabel = (trip) => {
         return 'Buscando conductor disponible';
     }
     return 'Asignando...';
+};
+
+
+const getOptionalNumber = (...values) => {
+    for (const value of values) {
+        if (value === null || value === undefined || value === '') continue;
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+};
+
+const getDriverDetailsFromTrip = (trip) => ({
+    id: trip?.driverId || '',
+    name: trip?.driver || trip?.driverName || 'Conductor asignado',
+    phone: trip?.driverPhone || '',
+    vehicle: trip?.vehicle || trip?.driverVehicle || '',
+    vehicleModel: trip?.vehicleModel || '',
+    vehicleType: trip?.vehicleType || '',
+    vehiclePlate: trip?.vehiclePlate || trip?.driverVehiclePlate || '',
+    rating: getOptionalNumber(trip?.driverRating, trip?.rating),
+    fotoPerfil: trip?.driverPhoto || trip?.fotoPerfil || '',
+    status: trip?.driverStatus || ''
+});
+
+const mergeDriverDetails = (trip, driverData = {}) => {
+    const fallback = getDriverDetailsFromTrip(trip);
+
+    return {
+        ...fallback,
+        ...driverData,
+        id: driverData?.id || fallback.id,
+        name: driverData?.name || fallback.name,
+        phone: driverData?.phone || fallback.phone,
+        vehicle: driverData?.vehicle || fallback.vehicle,
+        vehicleModel: driverData?.vehicleModel || fallback.vehicleModel,
+        vehicleType: driverData?.vehicleType || fallback.vehicleType,
+        vehiclePlate: driverData?.vehiclePlate || fallback.vehiclePlate,
+        rating: getOptionalNumber(driverData?.rating, fallback.rating),
+        fotoPerfil: driverData?.fotoPerfil || fallback.fotoPerfil,
+        status: driverData?.status || fallback.status
+    };
+};
+
+const ARRIVAL_ORDINALS = [
+    'primer',
+    'segundo',
+    'tercer',
+    'cuarto',
+    'quinto',
+    'sexto',
+    'séptimo',
+    'octavo',
+    'noveno',
+    'décimo'
+];
+
+const getArrivalStageInfo = (trip) => {
+    const waypointData = Array.isArray(trip?.waypointsData) ? trip.waypointsData : [];
+    const waypointCount = waypointData.length;
+
+    const rawIndexCandidates = [
+        trip?.proximityAlert?.stopIndex,
+        trip?.liveNavigation?.stopIndex,
+        trip?.currentStopIndex,
+        trip?.nextStopIdx,
+        0
+    ];
+
+    let stopIndex = 0;
+    for (const candidate of rawIndexCandidates) {
+        if (candidate === null || candidate === undefined || candidate === '') continue;
+        const parsed = Number(candidate);
+        if (Number.isFinite(parsed) && parsed >= 0) {
+            stopIndex = Math.trunc(parsed);
+            break;
+        }
+    }
+
+    const alertPassenger = String(trip?.proximityAlert?.passenger || '').trim();
+
+    if (stopIndex <= 0) {
+        const target = alertPassenger || trip?.startCoords?.passengerName || trip?.startCoords?.contact || trip?.start || '';
+        return {
+            stopIndex: 0,
+            cardLabel: 'LLEGANDO AL PUNTO DE ORIGEN',
+            modalLabel: 'al punto de origen',
+            target
+        };
+    }
+
+    if (stopIndex <= waypointCount) {
+        const waypoint = waypointData[stopIndex - 1] || {};
+        const ordinal = ARRIVAL_ORDINALS[stopIndex - 1] || `punto intermedio ${stopIndex}`;
+        const target = alertPassenger || waypoint?.passengerName || waypoint?.contact || waypoint?.address || trip?.waypoints?.[stopIndex - 1] || '';
+
+        return {
+            stopIndex,
+            cardLabel: ARRIVAL_ORDINALS[stopIndex - 1]
+                ? `LLEGANDO AL ${ordinal.toUpperCase()} PUNTO INTERMEDIO`
+                : `LLEGANDO AL PUNTO INTERMEDIO ${stopIndex}`,
+            modalLabel: ARRIVAL_ORDINALS[stopIndex - 1]
+                ? `al ${ordinal} punto intermedio`
+                : `al punto intermedio ${stopIndex}`,
+            target
+        };
+    }
+
+    const target = alertPassenger || trip?.endCoords?.passengerName || trip?.endCoords?.contact || trip?.end || '';
+    return {
+        stopIndex,
+        cardLabel: 'LLEGANDO AL DESTINO FINAL',
+        modalLabel: 'al destino final',
+        target
+    };
+};
+
+
+const getArrivalAcknowledgementText = (trip) => {
+    const stage = getArrivalStageInfo(trip);
+    const waypointCount = Array.isArray(trip?.waypointsData)
+        ? trip.waypointsData.length
+        : 0;
+
+    if (stage.stopIndex <= 0) {
+        return 'ENTENDIDO, YA VOY SALIENDO';
+    }
+
+    if (stage.stopIndex <= waypointCount) {
+        return 'ENTENDIDO, ESTOY LISTO';
+    }
+
+    return 'ENTENDIDO, GRACIAS';
+};
+
+const getProximityAlertKey = (trip) => {
+    const rawStopIndex = trip?.proximityAlert?.stopIndex;
+    const parsedStopIndex = (rawStopIndex === null || rawStopIndex === undefined || rawStopIndex === '')
+        ? getArrivalStageInfo(trip).stopIndex
+        : Number(rawStopIndex);
+
+    const safeStopIndex = Number.isFinite(parsedStopIndex)
+        ? Math.max(0, Math.trunc(parsedStopIndex))
+        : 0;
+
+    return `${trip?.id || 'trip'}:${safeStopIndex}`;
 };
 
 const getDriverCarIcon = () => {
@@ -725,7 +1089,9 @@ const getAuthoritativeLiveMetrics = (viaje) => {
             : null
     );
 
-    const hasOfficialLiveData = liveDistanceKm !== null || liveDurationMinutes !== null;
+    const hasLiveNumbers = liveDistanceKm !== null || liveDurationMinutes !== null;
+    const source = String(live.source || '');
+    const isDriverSource = source.startsWith('driver-');
     const distance = liveDistanceKm ?? fallbackDistance;
     const duration = liveDurationMinutes ?? fallbackDuration;
 
@@ -734,23 +1100,48 @@ const getAuthoritativeLiveMetrics = (viaje) => {
         totalDuration: duration === null ? '--' : Math.max(0, Math.round(duration)),
         nextStopDistance: nextStopDistanceKm === null ? '' : nextStopDistanceKm.toFixed(1),
         nextStopDuration: nextStopDurationMinutes === null ? '' : Math.max(0, Math.round(nextStopDurationMinutes)),
-        stopIndex: firstFiniteNumber(live.stopIndex) ?? 0,
-        isLive: hasOfficialLiveData && Boolean(viaje?.currentLocation),
-        source: hasOfficialLiveData ? (live.source || 'conductor') : 'ruta-planificada',
-        updatedAt: live.updatedAt || viaje?.lastUpdate || ''
+        stopIndex: firstFiniteNumber(live.stopIndex, live.currentStopIndex) ?? 0,
+        heading: normalizeHeadingDegrees(
+            live.heading ??
+            viaje?.liveHeading ??
+            0
+        ),
+        isLive: hasLiveNumbers && isDriverSource && Boolean(viaje?.currentLocation),
+        source: hasLiveNumbers ? (source || 'ruta-planificada') : 'ruta-planificada',
+        updatedAt: live.updatedAt || viaje?.liveRouteUpdatedAt || viaje?.lastUpdate || ''
     };
 };
 
-const getTrackingPath = (viaje) => {
-    const candidates = [
-        viaje?.liveNavigation?.geometry,
-        viaje?.liveRouteGeometry,
-        viaje?.technicalData?.geometry
-    ];
+const trimPathFromPoint = (path, point) => {
+    const validPath = normalizePath(path);
+    const validPoint = normalizePoint(point);
 
-    for (const candidate of candidates) {
-        const path = normalizePath(candidate);
-        if (path.length > 1) return path;
+    if (!validPoint || validPath.length < 3) return validPath;
+
+    let closestIndex = 0;
+    let closestDistance = Infinity;
+
+    validPath.forEach((candidate, index) => {
+        const distance = getDistanceMeters(validPoint, candidate);
+        if (distance < closestDistance) {
+            closestDistance = distance;
+            closestIndex = index;
+        }
+    });
+
+    return validPath.slice(Math.max(0, closestIndex - 1));
+};
+
+const getTrackingPath = (viaje) => {
+    const liveRoute = normalizePath(viaje?.liveRouteGeometry);
+    if (liveRoute.length > 1) return liveRoute;
+
+    const liveEmbeddedRoute = normalizePath(viaje?.liveNavigation?.geometry);
+    if (liveEmbeddedRoute.length > 1) return liveEmbeddedRoute;
+
+    const plannedRoute = normalizePath(viaje?.technicalData?.geometry);
+    if (plannedRoute.length > 1) {
+        return trimPathFromPoint(plannedRoute, viaje?.currentLocation);
     }
 
     return [];
@@ -763,7 +1154,8 @@ const LiveTrackingMap = ({
     viaje,
     expanded = false,
     followDriver = true,
-    onMetricsChange
+    onMetricsChange,
+    onDriverInfoClick = null
 }) => {
     const mapRef = useRef(null);
 
@@ -776,24 +1168,68 @@ const LiveTrackingMap = ({
     const visiblePath = getTrackingPath(viaje);
     const center = driverPoint || startPoint || visiblePath[0] || MAP_CENTER_MX;
     const metrics = getAuthoritativeLiveMetrics(viaje);
+    const currentStopIndex = Math.max(0, Math.trunc(Number(metrics.stopIndex) || 0));
+    const remainingWaypointPoints = waypointPoints.filter(
+        (_, index) => (index + 1) >= currentStopIndex
+    );
+    const liveHeading = normalizeHeadingDegrees(
+        viaje?.liveNavigation?.heading ??
+        viaje?.liveHeading ??
+        0
+    );
+
+    const firstPathPoint = visiblePath[0];
+    const middlePathPoint = visiblePath[Math.floor(visiblePath.length / 2)];
+    const lastPathPoint = visiblePath[visiblePath.length - 1];
+
+    const pathSignature = [
+        visiblePath.length,
+        firstPathPoint?.lat,
+        firstPathPoint?.lng,
+        middlePathPoint?.lat,
+        middlePathPoint?.lng,
+        lastPathPoint?.lat,
+        lastPathPoint?.lng,
+        viaje?.liveRouteUpdatedAt,
+        viaje?.liveNavigation?.updatedAt
+    ].join('|');
 
     const adjustMap = useCallback((map) => {
         if (!map || !window.google?.maps) return;
 
         try {
-            if (typeof map.setTilt === 'function') map.setTilt(0);
-            if (typeof map.setHeading === 'function') map.setHeading(0);
+            if (typeof map.setTilt === 'function' && Number(map.getTilt?.()) !== 0) {
+                map.setTilt(0);
+            }
 
             if (followDriver && driverPoint) {
                 map.panTo(driverPoint);
-                map.setZoom(expanded ? 17 : 16);
+
+                const targetZoom = expanded ? 17 : 16;
+                const currentZoom = Number(map.getZoom?.());
+                if (!Number.isFinite(currentZoom) || Math.abs(currentZoom - targetZoom) >= 1) {
+                    map.setZoom(targetZoom);
+                }
+
+                const currentHeading = normalizeHeadingDegrees(map.getHeading?.() || 0);
+                if (
+                    typeof map.setHeading === 'function' &&
+                    getHeadingDifference(currentHeading, liveHeading) >= 8
+                ) {
+                    map.setHeading(liveHeading);
+                }
+
                 return;
+            }
+
+            if (typeof map.setHeading === 'function') {
+                map.setHeading(0);
             }
 
             const points = [
                 ...visiblePath,
-                startPoint,
-                ...waypointPoints,
+                currentStopIndex <= 0 ? startPoint : null,
+                ...remainingWaypointPoints,
                 endPoint,
                 driverPoint
             ].filter(Boolean);
@@ -821,17 +1257,54 @@ const LiveTrackingMap = ({
         startPoint?.lng,
         endPoint?.lat,
         endPoint?.lng,
-        visiblePath.length,
-        waypointPoints.length
+        liveHeading,
+        pathSignature,
+        currentStopIndex,
+        remainingWaypointPoints.length
     ]);
 
     const handleLoad = useCallback((map) => {
         mapRef.current = map;
         adjustMap(map);
+
+        setTimeout(() => {
+            try {
+                if (window.google?.maps?.event) {
+                    window.google.maps.event.trigger(map, 'resize');
+                }
+                adjustMap(map);
+            } catch (_) {}
+        }, 250);
     }, [adjustMap]);
 
     useEffect(() => {
         if (mapRef.current) adjustMap(mapRef.current);
+    }, [adjustMap]);
+
+    useEffect(() => {
+        const handleResume = () => {
+            if (document.visibilityState && document.visibilityState !== 'visible') return;
+
+            setTimeout(() => {
+                if (!mapRef.current) return;
+                try {
+                    if (window.google?.maps?.event) {
+                        window.google.maps.event.trigger(mapRef.current, 'resize');
+                    }
+                    adjustMap(mapRef.current);
+                } catch (_) {}
+            }, 350);
+        };
+
+        document.addEventListener('visibilitychange', handleResume);
+        window.addEventListener('pageshow', handleResume);
+        window.addEventListener('focus', handleResume);
+
+        return () => {
+            document.removeEventListener('visibilitychange', handleResume);
+            window.removeEventListener('pageshow', handleResume);
+            window.removeEventListener('focus', handleResume);
+        };
     }, [adjustMap]);
 
     useEffect(() => {
@@ -859,6 +1332,7 @@ const LiveTrackingMap = ({
                 onLoad={handleLoad}
                 onUnmount={() => { mapRef.current = null; }}
                 options={{
+                    mapId: GOOGLE_VECTOR_MAP_ID,
                     disableDefaultUI: true,
                     gestureHandling: 'greedy',
                     backgroundColor: '#e2e8f0',
@@ -883,15 +1357,23 @@ const LiveTrackingMap = ({
                     />
                 )}
 
-                {startPoint && <Marker position={startPoint} label="A" />}
+                {currentStopIndex <= 0 && startPoint && (
+                    <Marker position={startPoint} label="A" />
+                )}
 
-                {waypointPoints.map((point, index) => (
-                    <Marker
-                        key={`tracking-waypoint-${index}`}
-                        position={point}
-                        label={String(index + 1)}
-                    />
-                ))}
+                {remainingWaypointPoints.map((point) => {
+                    const originalIndex = waypointPoints.findIndex(
+                        waypoint => waypoint.lat === point.lat && waypoint.lng === point.lng
+                    );
+
+                    return (
+                        <Marker
+                            key={`tracking-waypoint-${originalIndex}`}
+                            position={point}
+                            label={String(originalIndex + 1)}
+                        />
+                    );
+                })}
 
                 {endPoint && <Marker position={endPoint} label="B" />}
 
@@ -904,18 +1386,24 @@ const LiveTrackingMap = ({
                 )}
             </GoogleMap>
 
-            <div className="absolute top-3 left-3 bg-white/95 backdrop-blur px-3 py-2 rounded-full shadow-lg border border-slate-200 flex items-center gap-2">
+            <button
+                type="button"
+                onClick={() => onDriverInfoClick?.(viaje)}
+                disabled={!onDriverInfoClick || !viaje?.driver}
+                className={`absolute top-3 left-3 bg-white/95 backdrop-blur px-3 py-2 rounded-full shadow-lg border border-slate-200 flex items-center gap-2 transition ${onDriverInfoClick && viaje?.driver ? 'cursor-pointer hover:bg-orange-50 hover:border-orange-300 active:scale-95' : 'cursor-default'}`}
+                aria-label={metrics.isLive ? 'Ver datos del conductor' : 'Información de ruta planificada'}
+            >
                 <span className={`w-2.5 h-2.5 rounded-full ${metrics.isLive ? 'bg-green-500 animate-pulse' : 'bg-slate-300'}`}></span>
                 <span className="text-[10px] font-black uppercase text-slate-600">
                     {metrics.isLive ? 'Datos del conductor' : 'Ruta planificada'}
                 </span>
-            </div>
+            </button>
         </div>
     );
 };
 
 
-export default function App() {
+function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [isRegistering, setIsRegistering] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -950,6 +1438,10 @@ export default function App() {
   const [expandedMapTripId, setExpandedMapTripId] = useState(null);
   const [followExpandedMap, setFollowExpandedMap] = useState(true);
   const [liveTripMetrics, setLiveTripMetrics] = useState({});
+  const [driverDetailsTrip, setDriverDetailsTrip] = useState(null);
+  const [driverDetails, setDriverDetails] = useState(null);
+  const [driverDetailsLoading, setDriverDetailsLoading] = useState(false);
+  const [driverDetailsError, setDriverDetailsError] = useState('');
   const [sharedTripId] = useState(() => {
       try { return new URLSearchParams(window.location.search).get('trip') || ''; } catch (_) { return ''; }
   });
@@ -994,6 +1486,61 @@ export default function App() {
         };
     });
   }, []);
+
+  const openDriverDetails = useCallback((trip) => {
+      if (!trip) return;
+      setDriverDetailsTrip(trip);
+      setDriverDetails(mergeDriverDetails(trip));
+      setDriverDetailsError('');
+  }, []);
+
+  const closeDriverDetails = useCallback(() => {
+      setDriverDetailsTrip(null);
+      setDriverDetails(null);
+      setDriverDetailsLoading(false);
+      setDriverDetailsError('');
+  }, []);
+
+  useEffect(() => {
+      if (!driverDetailsTrip) return undefined;
+
+      const fallback = mergeDriverDetails(driverDetailsTrip);
+      setDriverDetails(fallback);
+      setDriverDetailsError('');
+
+      if (!driverDetailsTrip.driverId) {
+          setDriverDetailsLoading(false);
+          setDriverDetailsError('El viaje todavía no tiene un perfil de conductor vinculado.');
+          return undefined;
+      }
+
+      setDriverDetailsLoading(true);
+
+      const unsubscribe = onSnapshot(
+          doc(db, 'conductores', driverDetailsTrip.driverId),
+          (snapshot) => {
+              if (snapshot.exists()) {
+                  setDriverDetails(mergeDriverDetails(driverDetailsTrip, {
+                      id: snapshot.id,
+                      ...snapshot.data()
+                  }));
+                  setDriverDetailsError('');
+              } else {
+                  setDriverDetails(fallback);
+                  setDriverDetailsError('No se encontró el perfil completo del conductor.');
+              }
+              setDriverDetailsLoading(false);
+          },
+          (driverError) => {
+              console.error('No se pudieron cargar los datos del conductor:', driverError);
+              setDriverDetails(fallback);
+              setDriverDetailsError('No fue posible actualizar los datos del conductor en este momento.');
+              setDriverDetailsLoading(false);
+          }
+      );
+
+      return unsubscribe;
+  }, [driverDetailsTrip?.id, driverDetailsTrip?.driverId]);
 
   useEffect(() => {
     const savedUser = localStorage.getItem('client_session');
@@ -1275,32 +1822,46 @@ export default function App() {
   const compartirSeguimiento = async (viaje) => {
       if (!viaje?.id) return;
 
-      const configuredBase = String(import.meta.env.VITE_PUBLIC_APP_URL || 'https://app-angel-three.vercel.app')
+      const officialBase = 'https://app-cliente-five.vercel.app';
+      const rawConfiguredBase = String(
+          import.meta.env.VITE_PUBLIC_APP_URL || officialBase
+      )
           .trim()
           .replace(/\/$/, '');
+
+      const configuredBase = rawConfiguredBase.includes('app-angel-three.vercel.app')
+          ? officialBase
+          : rawConfiguredBase;
 
       const runtimeBase = (
           /^https?:$/.test(window.location.protocol) &&
           !['localhost', '127.0.0.1'].includes(window.location.hostname)
       ) ? window.location.origin : '';
 
-      const baseUrl = configuredBase || runtimeBase;
+      const baseUrl = configuredBase || runtimeBase || officialBase;
 
       if (!baseUrl) {
-          alert('Para compartir desde la APK agrega VITE_PUBLIC_APP_URL con la URL pública de Vercel y vuelve a compilar.');
+          alert('Configura VITE_PUBLIC_APP_URL con la URL pública de TripLogix y vuelve a compilar.');
           return;
       }
 
       const url = `${baseUrl}/?trip=${encodeURIComponent(viaje.id)}`;
-      const shareData = {
-          title: 'Seguimiento TripLogix',
-          text: `Sigue en tiempo real el viaje de ${viaje.client || 'TripLogix'}.`,
-          url
-      };
+      const title = 'Seguimiento TripLogix';
+      const text = `Sigue en tiempo real el viaje de ${viaje.client || 'TripLogix'}.`;
 
       try {
+          if (Capacitor.isNativePlatform()) {
+              await Share.share({
+                  title,
+                  text,
+                  url,
+                  dialogTitle: 'Compartir seguimiento TripLogix'
+              });
+              return;
+          }
+
           if (navigator.share) {
-              await navigator.share(shareData);
+              await navigator.share({ title, text, url });
               return;
           }
 
@@ -1414,7 +1975,7 @@ export default function App() {
       prevTripsRef.current = newState;
   }, [misViajes]);
 
-  const arrivingTrip = misViajes.find(v => v.status === 'En Ruta' && v.proximityAlert?.active && !dismissedAlerts.includes(v.id));
+  const arrivingTrip = misViajes.find(v => v.status === 'En Ruta' && v.proximityAlert?.active && !dismissedAlerts.includes(getProximityAlertKey(v)));
 
   useEffect(() => {
       if (chatScrollRef.current) {
@@ -1579,11 +2140,7 @@ export default function App() {
         chat: [],
         assignmentStatus: 'Preparando asignación',
         assignmentTriedDriverIds: [],
-        pricing: {
-            ...estimatedPricing,
-            estimatedAt: nowIso,
-            model: 'TripLogix base + distancia + tiempo + cuota operativa'
-        },
+        pricingStatus: 'Pendiente de cálculo del conductor',
         liveNavigation: {
             distanceKm: Number(distanceKm),
             durationMinutes: durationMin,
@@ -1725,6 +2282,7 @@ export default function App() {
 
   if (sharedTripId) {
       const sharedMetrics = sharedTrip ? getAuthoritativeLiveMetrics(sharedTrip) : null;
+      const sharedPricing = sharedTrip ? getDriverPublishedPricing(sharedTrip) : null;
 
       return (
           <div className="min-h-screen bg-slate-950 font-sans flex flex-col">
@@ -1773,9 +2331,23 @@ export default function App() {
                           </div>
                       </div>
                       <div className="mt-3 bg-slate-50 border border-slate-200 rounded-2xl p-4">
-                          <p className="text-[10px] font-black uppercase text-slate-400">Estado</p>
-                          <p className="font-black text-slate-800">{sharedTrip.status || 'Pendiente'}</p>
-                          <p className="text-xs text-slate-500 mt-1">Conductor: {getTripDriverLabel(sharedTrip)}</p>
+                          <div className="flex items-start justify-between gap-4">
+                              <div>
+                                  <p className="text-[10px] font-black uppercase text-slate-400">Estado</p>
+                                  <p className="font-black text-slate-800">{sharedTrip.status || 'Pendiente'}</p>
+                                  <p className="text-xs text-slate-500 mt-1">Conductor: {getTripDriverLabel(sharedTrip)}</p>
+                              </div>
+                              {!sharedPricing?.hidden && (
+                                  <div className="text-right">
+                                      <p className="text-[10px] font-black uppercase text-slate-400">Tarifa</p>
+                                      <p className="font-black text-orange-600">
+                                          {sharedPricing?.available
+                                              ? formatTripLogixMoney(sharedPricing.total, sharedPricing.currency)
+                                              : 'Calculando...'}
+                                      </p>
+                                  </div>
+                              )}
+                          </div>
                       </div>
                   </div>
               )}
@@ -1997,6 +2569,7 @@ export default function App() {
                           expanded={true}
                           followDriver={followExpandedMap}
                           onMetricsChange={handleLiveMetricsChange}
+                          onDriverInfoClick={openDriverDetails}
                       />
                   ) : (
                       <div className="w-full h-full flex items-center justify-center text-white">
@@ -2068,6 +2641,110 @@ export default function App() {
           </div>
       )}
 
+      {driverDetailsTrip && (
+          <div className="fixed inset-0 z-[10010] flex items-center justify-center p-5 bg-slate-900/80 backdrop-blur-md animate-in fade-in duration-200">
+              <div className="w-full max-w-sm bg-white rounded-[2rem] shadow-2xl overflow-hidden border border-slate-200">
+                  <div className="bg-slate-900 text-white px-5 py-5 flex items-center justify-between">
+                      <div>
+                          <p className="text-[10px] font-black uppercase tracking-widest text-orange-400">Información verificada</p>
+                          <h2 className="text-xl font-black mt-1">Datos del conductor</h2>
+                      </div>
+                      <button
+                          type="button"
+                          onClick={closeDriverDetails}
+                          className="p-2 rounded-full bg-white/10 hover:bg-white/20 active:scale-95 transition"
+                          aria-label="Cerrar datos del conductor"
+                      >
+                          <X className="w-5 h-5" />
+                      </button>
+                  </div>
+
+                  <div className="p-5">
+                      {driverDetailsLoading && (
+                          <div className="flex items-center justify-center gap-2 py-3 text-slate-500 text-xs font-bold">
+                              <Loader2 className="w-4 h-4 animate-spin text-orange-500" /> Actualizando información...
+                          </div>
+                      )}
+
+                      <div className="flex items-center gap-4 pb-5 border-b border-slate-100">
+                          {driverDetails?.fotoPerfil ? (
+                              <img
+                                  src={driverDetails.fotoPerfil}
+                                  alt={driverDetails.name || 'Conductor'}
+                                  className="w-20 h-20 rounded-2xl object-cover border-2 border-orange-200 bg-slate-100"
+                              />
+                          ) : (
+                              <div className="w-20 h-20 rounded-2xl bg-orange-100 text-orange-600 flex items-center justify-center border-2 border-orange-200">
+                                  <User className="w-9 h-9" />
+                              </div>
+                          )}
+
+                          <div className="min-w-0 flex-1">
+                              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Conductor asignado</p>
+                              <h3 className="text-lg font-black text-slate-800 truncate">{driverDetails?.name || 'Conductor asignado'}</h3>
+                              {driverDetails?.rating !== null && driverDetails?.rating !== undefined && (
+                                  <p className="text-xs font-bold text-orange-600 mt-1">★ {Number(driverDetails.rating).toFixed(1)} de calificación</p>
+                              )}
+                          </div>
+                      </div>
+
+                      <div className="space-y-3 mt-5">
+                          <div className="flex items-start gap-3 p-3 rounded-2xl bg-slate-50 border border-slate-100">
+                              <Phone className="w-5 h-5 text-orange-500 mt-0.5 shrink-0" />
+                              <div className="min-w-0">
+                                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Teléfono</p>
+                                  {driverDetails?.phone ? (
+                                      <a href={`tel:${driverDetails.phone}`} className="text-sm font-bold text-slate-800 break-all hover:text-orange-600">
+                                          {driverDetails.phone}
+                                      </a>
+                                  ) : (
+                                      <p className="text-sm font-bold text-slate-500">No registrado</p>
+                                  )}
+                              </div>
+                          </div>
+
+                          <div className="flex items-start gap-3 p-3 rounded-2xl bg-slate-50 border border-slate-100">
+                              <Car className="w-5 h-5 text-orange-500 mt-0.5 shrink-0" />
+                              <div className="min-w-0">
+                                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Vehículo</p>
+                                  <p className="text-sm font-bold text-slate-800">
+                                      {driverDetails?.vehicleModel || driverDetails?.vehicle || 'Unidad no registrada'}
+                                  </p>
+                                  {driverDetails?.vehicleType && (
+                                      <p className="text-xs text-slate-500 mt-0.5">{driverDetails.vehicleType}</p>
+                                  )}
+                              </div>
+                          </div>
+
+                          <div className="flex items-start gap-3 p-3 rounded-2xl bg-slate-50 border border-slate-100">
+                              <ShieldCheck className="w-5 h-5 text-orange-500 mt-0.5 shrink-0" />
+                              <div className="min-w-0">
+                                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Placas</p>
+                                  <p className="text-sm font-black text-slate-800 uppercase">
+                                      {driverDetails?.vehiclePlate || 'No registradas'}
+                                  </p>
+                              </div>
+                          </div>
+                      </div>
+
+                      {driverDetailsError && (
+                          <p className="text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 rounded-xl p-3 mt-4">
+                              {driverDetailsError}
+                          </p>
+                      )}
+
+                      <button
+                          type="button"
+                          onClick={closeDriverDetails}
+                          className="w-full mt-5 bg-slate-900 hover:bg-slate-800 text-white font-black py-4 rounded-2xl uppercase tracking-widest text-xs active:scale-95 transition"
+                      >
+                          Cerrar
+                      </button>
+                  </div>
+              </div>
+          </div>
+      )}
+
       {arrivingTrip && (
           <div className="fixed inset-0 z-[9990] flex items-center justify-center p-6 bg-slate-900/80 backdrop-blur-md animate-in fade-in zoom-in duration-300">
               <div className="bg-white rounded-[2rem] p-8 max-w-sm w-full text-center shadow-2xl border-4 border-orange-500 relative overflow-hidden">
@@ -2075,8 +2752,16 @@ export default function App() {
                   <div className="relative z-10">
                       <div className="w-24 h-24 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-6 animate-bounce shadow-xl shadow-orange-500/40 border-4 border-white"><Car className="w-12 h-12 text-orange-600" /></div>
                       <h2 className="text-3xl font-black text-slate-800 tracking-tighter mb-2 uppercase">¡Prepárate!</h2>
-                      <p className="text-lg font-bold text-orange-600 mb-6 leading-tight">Tu transporte está llegando en <span className="text-3xl">{arrivingTrip.proximityAlert?.etaMins || 2}</span> min.</p>
-                      <button onClick={() => setDismissedAlerts([...dismissedAlerts, arrivingTrip.id])} className="w-full bg-slate-800 hover:bg-slate-900 text-white font-black p-4 rounded-2xl shadow-xl active:scale-95 transition-all text-sm tracking-widest flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5"/> ENTENDIDO, VOY SALIENDO</button>
+                      <p className="text-lg font-bold text-orange-600 leading-tight">
+                          Tu conductor está llegando {getArrivalStageInfo(arrivingTrip).modalLabel} en <span className="text-3xl">{arrivingTrip.proximityAlert?.etaMins || 2}</span> min.
+                      </p>
+                      {getArrivalStageInfo(arrivingTrip).target && (
+                          <p className="text-xs font-bold text-slate-500 mt-3 mb-6 px-3 line-clamp-2">
+                              {getArrivalStageInfo(arrivingTrip).target}
+                          </p>
+                      )}
+                      {!getArrivalStageInfo(arrivingTrip).target && <div className="mb-6"></div>}
+                      <button onClick={() => setDismissedAlerts(prev => [...new Set([...prev, getProximityAlertKey(arrivingTrip)])])} className="w-full bg-slate-800 hover:bg-slate-900 text-white font-black p-4 rounded-2xl shadow-xl active:scale-95 transition-all text-sm tracking-widest flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5"/> {getArrivalAcknowledgementText(arrivingTrip)}</button>
                   </div>
               </div>
           </div>
@@ -2385,17 +3070,18 @@ export default function App() {
               <div className="space-y-6">
                 {activeTrips.map(viaje => {
                     const isArriving = viaje.status === 'En Ruta' && viaje.proximityAlert?.active;
+                    const arrivalStageInfo = getArrivalStageInfo(viaje);
                     const authoritativeMetrics = getAuthoritativeLiveMetrics(viaje);
                     const displayDistance = authoritativeMetrics.totalDistance;
                     const displayDuration = authoritativeMetrics.totalDuration;
-                    const costoEstimado = calculateTripLogixFare(viaje).total.toFixed(2); 
+                    const driverPricing = getDriverPublishedPricing(viaje);
 
                     return (
                         <div key={viaje.id} className={`bg-white rounded-[2rem] shadow-xl overflow-hidden border-2 transition-colors ${isArriving ? 'border-orange-500 shadow-orange-500/20' : 'border-slate-800'}`}>
                             <div className={`p-4 flex justify-between items-center text-white ${isArriving ? 'bg-orange-500' : 'bg-slate-800'}`}>
                                 <div className="flex items-center gap-2 font-bold text-sm">
                                     {isArriving ? <BellRing className="w-4 h-4 animate-bounce" /> : <Navigation className="w-4 h-4 animate-pulse" />}
-                                    {viaje.status === 'Pendiente' ? (viaje.ofertaEstado === 'Pendiente' ? 'CONFIRMANDO CONDUCTOR...' : 'ASIGNANDO UNIDAD...') : viaje.status === 'Aceptada' ? 'VIAJE ACEPTADO' : isArriving ? '¡CONDUCTOR LLEGANDO!' : 'VIAJE EN CURSO'}
+                                    {viaje.status === 'Pendiente' ? (viaje.ofertaEstado === 'Pendiente' ? 'CONFIRMANDO CONDUCTOR...' : 'ASIGNANDO UNIDAD...') : viaje.status === 'Aceptada' ? 'VIAJE ACEPTADO' : isArriving ? `¡${arrivalStageInfo.cardLabel}!` : 'VIAJE EN CURSO'}
                                 </div>
                                 <div className="text-[10px] font-black uppercase bg-black/20 px-2 py-1 rounded-lg">{viaje.serviceType}</div>
                             </div>
@@ -2405,6 +3091,7 @@ export default function App() {
                                     <LiveTrackingMap
                                         viaje={viaje}
                                         onMetricsChange={handleLiveMetricsChange}
+                                        onDriverInfoClick={openDriverDetails}
                                     />
                                 ) : (
                                     <div className="w-full h-full flex items-center justify-center text-slate-400"><Loader2 className="w-6 h-6 animate-spin"/></div>
@@ -2416,7 +3103,7 @@ export default function App() {
                                 >
                                     Expandir
                                 </button>
-                                {viaje.status === 'En Ruta' && liveMetrics.isLive && (
+                                {viaje.status === 'En Ruta' && authoritativeMetrics.isLive && (
                                     <div className="absolute bottom-3 left-3 bg-slate-900/90 text-white rounded-full px-3 py-2 text-[10px] font-black uppercase tracking-widest shadow-lg">
                                         Ruta en vivo
                                     </div>
@@ -2445,9 +3132,37 @@ export default function App() {
                                         </div>
                                         <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm flex items-center justify-between">
                                             <div className="flex items-center gap-3"><div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-slate-500"><User className="w-6 h-6"/></div><div><p className="text-[10px] font-black text-slate-400 uppercase">Tu Conductor</p><p className="text-sm font-bold text-slate-800">{getTripDriverLabel(viaje)}</p>{viaje.driver && <p className="text-[10px] font-bold text-slate-400 mt-0.5">Unidad Estándar</p>}</div></div>
-                                            <div className="text-right"><p className="text-[10px] font-black text-slate-400 uppercase">Tarifa Est.</p><p className="text-2xl font-black text-slate-800">${costoEstimado}</p></div>
+                                            {!driverPricing.hidden ? (
+                                                <div className="text-right">
+                                                    <p className="text-[10px] font-black text-slate-400 uppercase">
+                                                        {driverPricing.available ? 'Tarifa oficial' : 'Tarifa'}
+                                                    </p>
+                                                    <p className="text-2xl font-black text-slate-800">
+                                                        {driverPricing.available
+                                                            ? formatTripLogixMoney(driverPricing.total, driverPricing.currency)
+                                                            : 'Calculando...'}
+                                                    </p>
+                                                    <p className="text-[9px] font-bold text-slate-400 mt-0.5">
+                                                        {driverPricing.source}
+                                                    </p>
+                                                </div>
+                                            ) : (
+                                                <div className="text-right max-w-[130px]">
+                                                    <p className="text-[10px] font-black text-blue-600 uppercase">Servicio corporativo</p>
+                                                    <p className="text-[10px] font-bold text-slate-400 mt-1">Tarifa administrada por despacho</p>
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
+                                )}
+                                {viaje.driver && (
+                                    <button
+                                        type="button"
+                                        onClick={() => openDriverDetails(viaje)}
+                                        className="w-full mt-4 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 font-black p-3.5 rounded-xl text-xs flex items-center justify-center gap-2 transition-colors shadow-sm"
+                                    >
+                                        <User className="w-4 h-4 text-orange-500" /> DATOS DEL CONDUCTOR
+                                    </button>
                                 )}
                                 <button
                                     type="button"
@@ -2550,5 +3265,13 @@ export default function App() {
         <button onClick={() => setActiveTab('billetera')} className={`flex flex-col items-center gap-1 transition-all ${activeTab === 'billetera' ? 'text-orange-500 scale-110' : 'text-slate-400 hover:text-slate-600'}`}><CreditCard className={`w-6 h-6 ${activeTab === 'billetera' && 'fill-orange-50'}`} /><span className="text-[10px] font-black uppercase tracking-widest">Pagos</span></button>
       </div>
     </div>
+  );
+}
+
+export default function TripLogixClientRoot() {
+  return (
+    <TripLogixClientErrorBoundary>
+      <App />
+    </TripLogixClientErrorBoundary>
   );
 }
