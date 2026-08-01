@@ -906,15 +906,14 @@ const getArrivalStageInfo = (trip) => {
         0
     ];
 
-    let stopIndex = 0;
-    for (const candidate of rawIndexCandidates) {
-        if (candidate === null || candidate === undefined || candidate === '') continue;
-        const parsed = Number(candidate);
-        if (Number.isFinite(parsed) && parsed >= 0) {
-            stopIndex = Math.trunc(parsed);
-            break;
-        }
-    }
+    const validStopIndexes = rawIndexCandidates
+        .map(candidate => Number(candidate))
+        .filter(candidate => Number.isFinite(candidate) && candidate >= 0)
+        .map(candidate => Math.trunc(candidate));
+
+    // Se usa el punto más avanzado para impedir que una alerta antigua del
+    // primer pasajero mantenga la pantalla congelada cuando el conductor ya avanzó.
+    const stopIndex = validStopIndexes.length ? Math.max(...validStopIndexes) : 0;
 
     const alertPassenger = String(trip?.proximityAlert?.passenger || '').trim();
 
@@ -1433,7 +1432,9 @@ function App() {
 
   // --- Datos ---
   const [misViajes, setMisViajes] = useState([]);
-  const [dismissedAlerts, setDismissedAlerts] = useState([]);
+  const [dismissedAlerts, setDismissedAlerts] = useState(() => {
+      try { return JSON.parse(localStorage.getItem('triplogix_dismissed_arrival_alerts') || '[]'); } catch (_) { return []; }
+  });
   const [activeChatTripId, setActiveChatTripId] = useState(null);
   const [expandedMapTripId, setExpandedMapTripId] = useState(null);
   const [followExpandedMap, setFollowExpandedMap] = useState(true);
@@ -1460,8 +1461,9 @@ function App() {
   const [clientSecret, setClientSecret] = useState('');
   const [customerId, setCustomerId] = useState('');
   const [iniciandoStripe, setIniciandoStripe] = useState(false);
+  const [selectedPaymentTripId, setSelectedPaymentTripId] = useState(null);
 
-  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
+  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries, language: 'es', region: 'MX' });
   const originRef = useRef(null);
   const destRef = useRef(null);
   const waypointRefs = useRef([]);
@@ -1944,6 +1946,55 @@ function App() {
       playAlertSound();
       if ('vibrate' in navigator) navigator.vibrate([250, 100, 450]);
   }, [misViajes, expandedMapTripId]);
+
+  useEffect(() => {
+      try {
+          localStorage.setItem('triplogix_dismissed_arrival_alerts', JSON.stringify(dismissedAlerts.slice(-100)));
+      } catch (_) {}
+  }, [dismissedAlerts]);
+
+  const acknowledgeArrival = async (trip) => {
+      if (!trip?.id) return;
+
+      const alertKey = getProximityAlertKey(trip);
+      const stage = getArrivalStageInfo(trip);
+      const acknowledgementText = getArrivalAcknowledgementText(trip);
+      const nowIso = new Date().toISOString();
+      const response = {
+          eventId: `${trip.id}-client-response-${stage.stopIndex}-${Date.now()}`,
+          type: 'client_arrival_acknowledgement',
+          stopIndex: stage.stopIndex,
+          passenger: stage.target || currentUser?.name || 'Cliente',
+          response: acknowledgementText,
+          timestamp: nowIso,
+          time: new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })
+      };
+
+      setDismissedAlerts(prev => [...new Set([...prev, alertKey])]);
+
+      try {
+          await updateDoc(doc(db, 'rutas', trip.id), {
+              arrivalAcknowledgements: arrayUnion(response),
+              stopEvents: arrayUnion(response),
+              chat: arrayUnion({
+                  sender: 'Cliente',
+                  text: `${acknowledgementText} · ${stage.target || 'Punto confirmado'}`,
+                  time: response.time,
+                  timestamp: nowIso,
+                  stopIndex: stage.stopIndex,
+                  systemAcknowledgement: true
+              }),
+              [`arrivalResponses.${stage.stopIndex}`]: response
+          });
+      } catch (ackError) {
+          console.error('No se pudo guardar la confirmación del cliente:', ackError);
+      }
+  };
+
+  const openPaymentForTrip = (trip) => {
+      setSelectedPaymentTripId(trip?.id || null);
+      setActiveTab('billetera');
+  };
 
   // --- CONTROL DE ALERTAS SONORAS ---
   useEffect(() => {
@@ -2761,7 +2812,7 @@ function App() {
                           </p>
                       )}
                       {!getArrivalStageInfo(arrivingTrip).target && <div className="mb-6"></div>}
-                      <button onClick={() => setDismissedAlerts(prev => [...new Set([...prev, getProximityAlertKey(arrivingTrip)])])} className="w-full bg-slate-800 hover:bg-slate-900 text-white font-black p-4 rounded-2xl shadow-xl active:scale-95 transition-all text-sm tracking-widest flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5"/> {getArrivalAcknowledgementText(arrivingTrip)}</button>
+                      <button onClick={() => acknowledgeArrival(arrivingTrip)} className="w-full bg-slate-800 hover:bg-slate-900 text-white font-black p-4 rounded-2xl shadow-xl active:scale-95 transition-all text-sm tracking-widest flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5"/> {getArrivalAcknowledgementText(arrivingTrip)}</button>
                   </div>
               </div>
           </div>
@@ -3197,7 +3248,7 @@ function App() {
                       <div className="relative"><div className={`absolute -left-[19px] top-1 w-2.5 h-2.5 rounded-full ring-2 ring-white ${viaje.status === 'Cancelado' ? 'bg-red-300' : 'bg-orange-500'}`}></div><p className="text-xs font-medium text-slate-700 line-clamp-1">{(viaje.end || '').split(',')[0]}</p></div>
                     </div>
                     {viaje.status === 'Finalizado' && (
-                      <div className="grid grid-cols-2 gap-2 mt-4">
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mt-4">
                         <button
                           type="button"
                           onClick={() => downloadTripLogixReceiptPdf(viaje)}
@@ -3212,6 +3263,15 @@ function App() {
                         >
                           <Share2 className="w-4 h-4" /> Compartir
                         </button>
+                        {!isCorporate && !['Pagado', 'paid', 'Completado'].includes(String(viaje.paymentStatus || '')) && (
+                          <button
+                            type="button"
+                            onClick={() => openPaymentForTrip(viaje)}
+                            className="col-span-2 sm:col-span-1 p-3 rounded-xl bg-green-600 text-white font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 transition"
+                          >
+                            <CreditCard className="w-4 h-4" /> Ir a pagos
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -3226,6 +3286,21 @@ function App() {
             <div className="p-5 animate-[fadeIn_0.3s_ease-out]">
                 <h1 className="text-2xl font-black text-slate-800 tracking-tight mb-2">Billetera</h1>
                 <p className="text-sm text-slate-500 mb-6">Administra tus métodos de pago para los viajes.</p>
+
+                {selectedPaymentTripId && (() => {
+                    const paymentTrip = misViajes.find(item => item.id === selectedPaymentTripId);
+                    if (!paymentTrip) return null;
+                    const receipt = buildTripLogixReceipt(paymentTrip);
+                    return (
+                        <div className="mb-5 bg-green-50 border border-green-200 rounded-2xl p-4">
+                            <p className="text-[10px] font-black uppercase tracking-widest text-green-700">Viaje seleccionado</p>
+                            <p className="text-sm font-bold text-slate-800 mt-1">{(paymentTrip.start || 'Origen').split(',')[0]} → {(paymentTrip.end || 'Destino').split(',')[0]}</p>
+                            <p className="text-xl font-black text-green-700 mt-2">${Number(receipt.pricing.total || 0).toFixed(2)}</p>
+                            <p className="text-[10px] font-bold text-slate-500 mt-1">Vincula o revisa tu método de pago. El cargo automático requiere el backend de cobro de Stripe.</p>
+                        </div>
+                    );
+                })()}
+
 
                 {currentUser.hasCard ? (
                     <div className="bg-gradient-to-br from-slate-800 to-slate-900 rounded-3xl p-6 shadow-xl text-white relative overflow-hidden">
