@@ -347,8 +347,7 @@ const formatTripLogixDateTime = (value) => {
     const ms = getTimestampMs(value);
     if (!ms) return 'No registrado';
     return new Date(ms).toLocaleString('es-MX', {
-        timeZone: 'America/Mexico_City',
-        dateStyle: 'medium',
+                dateStyle: 'medium',
         timeStyle: 'short'
     });
 };
@@ -659,6 +658,43 @@ const TarjetaForm = ({ clientSecret, customerId, currentUser, onExito }) => {
 // HELPERS: MAPA EN VIVO DEL CLIENTE
 // =========================================================================
 const MAP_CENTER_MX = { lat: 19.4326, lng: -99.1332 };
+
+const getFreshDevicePosition = ({ timeoutMs = 14000, desiredAccuracy = 35 } = {}) => new Promise((resolve, reject) => {
+    if (!('geolocation' in navigator)) {
+        reject(new Error('La geolocalización no está disponible.'));
+        return;
+    }
+
+    let watchId = null;
+    let finished = false;
+    let bestPosition = null;
+    const finish = (error = null) => {
+        if (finished) return;
+        finished = true;
+        if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+        clearTimeout(timer);
+        if (bestPosition) resolve(bestPosition);
+        else reject(error || new Error('No fue posible obtener una ubicación reciente.'));
+    };
+
+    const timer = setTimeout(() => finish(new Error('La ubicación tardó demasiado.')), timeoutMs);
+    watchId = navigator.geolocation.watchPosition(
+        position => {
+            const accuracy = Number(position.coords.accuracy) || Infinity;
+            if (!bestPosition || accuracy < (Number(bestPosition.coords.accuracy) || Infinity)) bestPosition = position;
+            if (accuracy <= desiredAccuracy) finish();
+        },
+        error => finish(error),
+        { enableHighAccuracy: true, maximumAge: 0, timeout: timeoutMs }
+    );
+});
+
+const getTrafficDepartureTime = (dateValue = '', timeValue = '') => {
+    const now = new Date();
+    if (!dateValue || !timeValue) return now;
+    const candidate = new Date(`${dateValue}T${timeValue}:00`);
+    return Number.isFinite(candidate.getTime()) && candidate.getTime() >= now.getTime() ? candidate : now;
+};
 
 const toFiniteNumber = (value) => {
     const n = Number(value);
@@ -1154,9 +1190,11 @@ const LiveTrackingMap = ({
     expanded = false,
     followDriver = true,
     onMetricsChange,
-    onDriverInfoClick = null
+    onDriverInfoClick = null,
+    fallbackCenter = MAP_CENTER_MX
 }) => {
     const mapRef = useRef(null);
+    const [mapRevision, setMapRevision] = useState(0);
 
     const driverPoint = normalizePoint(viaje?.currentLocation);
     const startPoint = normalizePoint(viaje?.startCoords);
@@ -1165,7 +1203,7 @@ const LiveTrackingMap = ({
         .map(normalizePoint)
         .filter(Boolean);
     const visiblePath = getTrackingPath(viaje);
-    const center = driverPoint || startPoint || visiblePath[0] || MAP_CENTER_MX;
+    const center = driverPoint || startPoint || visiblePath[0] || fallbackCenter || MAP_CENTER_MX;
     const metrics = getAuthoritativeLiveMetrics(viaje);
     const currentStopIndex = Math.max(0, Math.trunc(Number(metrics.stopIndex) || 0));
     const remainingWaypointPoints = waypointPoints.filter(
@@ -1283,7 +1321,7 @@ const LiveTrackingMap = ({
     useEffect(() => {
         const handleResume = () => {
             if (document.visibilityState && document.visibilityState !== 'visible') return;
-
+            setMapRevision(revision => revision + 1);
             setTimeout(() => {
                 if (!mapRef.current) return;
                 try {
@@ -1292,7 +1330,7 @@ const LiveTrackingMap = ({
                     }
                     adjustMap(mapRef.current);
                 } catch (_) {}
-            }, 350);
+            }, 500);
         };
 
         document.addEventListener('visibilitychange', handleResume);
@@ -1325,6 +1363,7 @@ const LiveTrackingMap = ({
     return (
         <div className="relative w-full h-full">
             <GoogleMap
+                key={`live-tracking-map-${viaje?.id || 'route'}-${mapRevision}`}
                 mapContainerStyle={{ width: '100%', height: '100%' }}
                 center={center}
                 zoom={driverPoint ? 16 : 14}
@@ -1429,6 +1468,7 @@ function App() {
   const [frequentLocations, setFrequentLocations] = useState([]);
   const [routeReview, setRouteReview] = useState(null);
   const [isConfirmingTrip, setIsConfirmingTrip] = useState(false);
+  const [deviceMapCenter, setDeviceMapCenter] = useState(MAP_CENTER_MX);
 
   // --- Datos ---
   const [misViajes, setMisViajes] = useState([]);
@@ -1463,10 +1503,21 @@ function App() {
   const [iniciandoStripe, setIniciandoStripe] = useState(false);
   const [selectedPaymentTripId, setSelectedPaymentTripId] = useState(null);
 
-  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries, language: 'es', region: 'MX' });
+  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries, language: 'es' });
   const originRef = useRef(null);
   const destRef = useRef(null);
   const waypointRefs = useRef([]);
+
+  useEffect(() => {
+      let cancelled = false;
+      getFreshDevicePosition({ timeoutMs: 10000, desiredAccuracy: 60 })
+          .then(position => {
+              if (cancelled) return;
+              setDeviceMapCenter({ lat: position.coords.latitude, lng: position.coords.longitude });
+          })
+          .catch(() => {});
+      return () => { cancelled = true; };
+  }, []);
 
   const handleLiveMetricsChange = useCallback((tripId, metrics) => {
     if (!tripId || !metrics) return;
@@ -1775,50 +1826,27 @@ function App() {
       setWaypoints(prev => prev.filter((_, waypointIndex) => waypointIndex !== index));
   };
 
-  const usarUbicacionActualComoOrigen = () => {
-      if (!('geolocation' in navigator)) {
-          alert('Este dispositivo no permite obtener la ubicación actual.');
-          return;
-      }
-
+  const usarUbicacionActualComoOrigen = async () => {
       setIsLocatingOrigin(true);
+      try {
+          const position = await getFreshDevicePosition({ timeoutMs: 15000, desiredAccuracy: 30 });
+          const coords = { lat: position.coords.latitude, lng: position.coords.longitude };
+          setDeviceMapCenter(coords);
+          setOrigenCoords(coords);
 
-      navigator.geolocation.getCurrentPosition(
-          async (position) => {
-              const coords = {
-                  lat: position.coords.latitude,
-                  lng: position.coords.longitude
-              };
-
-              setOrigenCoords(coords);
-
-              try {
-                  if (window.google?.maps?.Geocoder) {
-                      const geocoder = new window.google.maps.Geocoder();
-                      const response = await geocoder.geocode({ location: coords });
-                      const address = response?.results?.[0]?.formatted_address;
-                      setOrigen(address || 'Ubicación actual');
-                  } else {
-                      setOrigen('Ubicación actual');
-                  }
-              } catch (geocoderError) {
-                  console.warn('No se pudo obtener la dirección:', geocoderError);
-                  setOrigen('Ubicación actual');
-              } finally {
-                  setIsLocatingOrigin(false);
-              }
-          },
-          (locationError) => {
-              console.error('No se pudo obtener la ubicación:', locationError);
-              setIsLocatingOrigin(false);
-              alert('Activa la ubicación precisa y vuelve a intentarlo.');
-          },
-          {
-              enableHighAccuracy: true,
-              timeout: 15000,
-              maximumAge: 15000
+          if (window.google?.maps?.Geocoder) {
+              const geocoder = new window.google.maps.Geocoder();
+              const response = await geocoder.geocode({ location: coords });
+              setOrigen(response?.results?.[0]?.formatted_address || 'Ubicación actual');
+          } else {
+              setOrigen('Ubicación actual');
           }
-      );
+      } catch (locationError) {
+          console.error('No se pudo obtener una ubicación fresca:', locationError);
+          alert('Activa la ubicación precisa, desactiva el ahorro de batería para TripLogix y vuelve a intentarlo.');
+      } finally {
+          setIsLocatingOrigin(false);
+      }
   };
 
   const compartirSeguimiento = async (viaje) => {
@@ -2113,6 +2141,10 @@ function App() {
           })),
           optimizeWaypoints: false,
           travelMode: window.google.maps.TravelMode.DRIVING,
+          drivingOptions: {
+              departureTime: getTrafficDepartureTime(tipoServicio === 'Programado' ? fecha : '', tipoServicio === 'Programado' ? hora : ''),
+              trafficModel: window.google.maps.TrafficModel?.BEST_GUESS || 'bestguess'
+          }
       });
 
       const routeData = results?.routes?.[0];
@@ -2123,11 +2155,11 @@ function App() {
       }
 
       const distanceValue = legs.reduce((total, leg) => total + (leg.distance?.value || 0), 0);
-      const durationValue = legs.reduce((total, leg) => total + (leg.duration?.value || 0), 0);
+      const durationValue = legs.reduce((total, leg) => total + (leg.duration_in_traffic?.value ?? leg.duration?.value ?? 0), 0);
       const distanceKm = (distanceValue / 1000).toFixed(1);
       const durationMin = Math.max(1, Math.round(durationValue / 60));
       const firstLegDistanceKm = ((legs[0]?.distance?.value || 0) / 1000).toFixed(1);
-      const firstLegDurationMin = Math.max(1, Math.round((legs[0]?.duration?.value || 0) / 60));
+      const firstLegDurationMin = Math.max(1, Math.round((legs[0]?.duration_in_traffic?.value ?? legs[0]?.duration?.value ?? 0) / 60));
       const geometry = routeData.overview_path.map(point => ({
           lat: point.lat(),
           lng: point.lng()
@@ -2135,13 +2167,12 @@ function App() {
 
       const scheduledDate = tipoServicio === 'Programado'
           ? fecha
-          : new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+          : new Date().toLocaleDateString('en-CA');
 
       const scheduledTime = tipoServicio === 'Programado'
           ? hora
           : new Date().toLocaleTimeString('es-MX', {
-              timeZone: 'America/Mexico_City',
-              hour: '2-digit',
+                            hour: '2-digit',
               minute: '2-digit'
           });
 
@@ -2305,7 +2336,7 @@ function App() {
 
   const enviarMensajeCliente = async () => {
       if (!chatText.trim() || !activeChatTripId) return;
-      const msg = { sender: 'Cliente', text: chatText.trim(), time: new Date().toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute:'2-digit' }), timestamp: new Date().toISOString() };
+      const msg = { sender: 'Cliente', text: chatText.trim(), time: new Date().toLocaleTimeString('es-419', { hour: '2-digit', minute:'2-digit' }), timestamp: new Date().toISOString() };
       try { await updateDoc(doc(db, "rutas", activeChatTripId), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) { }
   };
 
@@ -2358,6 +2389,7 @@ function App() {
                           expanded={true}
                           followDriver={sharedTrip.status === 'En Ruta'}
                           onMetricsChange={handleLiveMetricsChange}
+                          fallbackCenter={deviceMapCenter}
                       />
                   ) : (
                       <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-white">
@@ -2620,6 +2652,7 @@ function App() {
                           expanded={true}
                           followDriver={followExpandedMap}
                           onMetricsChange={handleLiveMetricsChange}
+                          fallbackCenter={deviceMapCenter}
                           onDriverInfoClick={openDriverDetails}
                       />
                   ) : (
@@ -3142,6 +3175,7 @@ function App() {
                                     <LiveTrackingMap
                                         viaje={viaje}
                                         onMetricsChange={handleLiveMetricsChange}
+                                        fallbackCenter={deviceMapCenter}
                                         onDriverInfoClick={openDriverDetails}
                                     />
                                 ) : (
