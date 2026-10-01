@@ -36,6 +36,9 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android
 
+      - name: Normalize Gradle Java path for CI
+        run: sed -i '/^org.gradle.java.home=/d' android/gradle.properties
+
       - name: Build debug APK
         working-directory: android
         run: |
