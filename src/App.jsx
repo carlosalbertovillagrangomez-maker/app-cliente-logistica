@@ -1454,6 +1454,11 @@ function App() {
   const [phone, setPhone] = useState('');
   const [accountType, setAccountType] = useState('Individual'); 
   const [error, setError] = useState('');
+  const [showAccountRecovery, setShowAccountRecovery] = useState(false);
+  const [recoveryFeedback, setRecoveryFeedback] = useState('');
+  const [mustChangePassword, setMustChangePassword] = useState(false);
+  const [newRecoveryPassword, setNewRecoveryPassword] = useState('');
+  const [confirmRecoveryPassword, setConfirmRecoveryPassword] = useState('');
 
   // --- Formulario de Pedido ---
   const [origen, setOrigen] = useState('');
@@ -1601,6 +1606,7 @@ function App() {
       try {
         const parsedUser = JSON.parse(savedUser);
         setCurrentUser(parsedUser);
+        setMustChangePassword(Boolean(parsedUser?.passwordResetRequired));
         cargarDatosPerfil(parsedUser);
         if (parsedUser && parsedUser.name) escucharMisViajes(parsedUser.name); 
       } catch(e) { localStorage.removeItem('client_session'); }
@@ -2063,9 +2069,90 @@ function App() {
   }, [misViajes, activeChatTripId]);
 
   // --- AUTH POR TELÉFONO ---
+  const requestAccountRecovery = async () => {
+    const cleanPhone = phone.trim();
+    setError('');
+    setRecoveryFeedback('');
+
+    if (!cleanPhone) {
+      setError('Escribe tu número de teléfono para solicitar recuperación.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const q = query(collection(db, "clientes"), where("phone", "==", cleanPhone));
+      const snap = await getDocs(q);
+      if (snap.empty) throw new Error('Número de teléfono no encontrado');
+
+      const accountDoc = snap.docs[0];
+      const account = accountDoc.data();
+
+      await addDoc(collection(db, "recuperacionesCuenta"), {
+        accountType: 'Cliente',
+        accountCollection: 'clientes',
+        accountId: accountDoc.id,
+        phone: cleanPhone,
+        displayName: account?.name || 'Cliente',
+        status: 'Pendiente',
+        requestedAt: new Date().toISOString(),
+        source: 'com.triplogix.cliente'
+      });
+
+      setRecoveryFeedback('Solicitud enviada a Torre de Control. Por seguridad, validarán tu identidad antes de emitir una contraseña temporal.');
+      setShowAccountRecovery(false);
+    } catch (recoveryError) {
+      setError(recoveryError?.message || 'No fue posible enviar la solicitud de recuperación.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleForcedPasswordChange = async (e) => {
+    e.preventDefault();
+    setError('');
+
+    if (newRecoveryPassword.length < 8) {
+      setError('La nueva contraseña debe tener al menos 8 caracteres.');
+      return;
+    }
+    if (newRecoveryPassword !== confirmRecoveryPassword) {
+      setError('Las contraseñas no coinciden.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const changedAt = new Date().toISOString();
+      await updateDoc(doc(db, "clientes", currentUser.id), {
+        password: newRecoveryPassword,
+        passwordResetRequired: false,
+        passwordChangedAt: changedAt
+      });
+
+      const updatedUser = {
+        ...currentUser,
+        password: newRecoveryPassword,
+        passwordResetRequired: false,
+        passwordChangedAt: changedAt
+      };
+
+      setCurrentUser(updatedUser);
+      localStorage.setItem('client_session', JSON.stringify(updatedUser));
+      setPassword(newRecoveryPassword);
+      setNewRecoveryPassword('');
+      setConfirmRecoveryPassword('');
+      setMustChangePassword(false);
+    } catch (changeError) {
+      setError(changeError?.message || 'No fue posible actualizar la contraseña.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleAuth = async (e) => {
     e.preventDefault();
-    setLoading(true); setError('');
+    setLoading(true); setError(''); setRecoveryFeedback('');
     try {
       if (isRegistering) {
         if (!name || !phone || !password) throw new Error('Llena todos los campos');
@@ -2085,7 +2172,10 @@ function App() {
         if (snap.empty) throw new Error('Número de teléfono no encontrado');
         const userData = { id: snap.docs[0].id, ...snap.docs[0].data() };
         if (userData.password !== password) throw new Error('Contraseña incorrecta');
-        setCurrentUser(userData); cargarDatosPerfil(userData); localStorage.setItem('client_session', JSON.stringify(userData));
+        setCurrentUser(userData);
+        setMustChangePassword(Boolean(userData?.passwordResetRequired));
+        cargarDatosPerfil(userData);
+        localStorage.setItem('client_session', JSON.stringify(userData));
         escucharMisViajes(userData.name);
       }
     } catch (err) { setError(err.message); }
@@ -2460,9 +2550,24 @@ function App() {
             <div className="relative"><Phone className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><input type="tel" placeholder="WhatsApp / Teléfono" disabled={!isRegistering && loading} className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 text-sm outline-none focus:border-orange-500 focus:ring-4 focus:ring-orange-500/10 transition-all font-medium disabled:opacity-50" value={phone} onChange={e=>setPhone(e.target.value)} required /></div>
             <div className="relative"><Lock className="absolute left-3 top-3.5 w-5 h-5 text-slate-400"/><input type="password" placeholder="Contraseña" className="w-full pl-10 p-3 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 text-sm outline-none focus:border-orange-500 focus:ring-4 focus:ring-orange-500/10 transition-all font-medium" value={password} onChange={e=>setPassword(e.target.value)} required /></div>
             {error && <p className="text-red-500 text-[10px] font-bold text-center">{error}</p>}
+            {recoveryFeedback && <p className="text-emerald-600 text-[10px] font-bold text-center leading-relaxed">{recoveryFeedback}</p>}
+            {!isRegistering && showAccountRecovery && (
+              <div className="rounded-2xl border border-orange-200 bg-orange-50 p-4 text-left space-y-3">
+                <p className="text-[11px] font-black text-slate-700">Recuperación administrada</p>
+                <p className="text-[10px] text-slate-500 leading-relaxed">Torre de Control recibirá la solicitud y validará tu identidad antes de emitir una contraseña temporal.</p>
+                <button type="button" disabled={loading} onClick={requestAccountRecovery} className="w-full bg-orange-500 text-white font-black p-3 rounded-xl text-[10px] uppercase tracking-wider">
+                  {loading ? 'Enviando...' : 'Enviar solicitud'}
+                </button>
+              </div>
+            )}
             <button type="submit" disabled={loading} className="w-full bg-slate-800 hover:bg-slate-900 text-white font-black py-3.5 rounded-xl shadow-lg shadow-slate-800/30 transition-all uppercase tracking-wide text-sm mt-2 flex items-center justify-center">
                 {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : (isRegistering ? 'REGISTRARSE' : 'INICIAR SESIÓN')}
             </button>
+            {!isRegistering && (
+              <button type="button" onClick={() => { setShowAccountRecovery(prev => !prev); setError(''); }} className="w-full text-slate-600 font-bold text-[10px] py-1">
+                ¿Olvidaste tu contraseña? <span className="text-orange-500">Recuperar cuenta</span>
+              </button>
+            )}
           </form>
           <p className="text-xs text-slate-500 mt-6 text-center font-medium">
             {isRegistering ? '¿Ya tienes cuenta? ' : '¿No tienes cuenta? '} 
@@ -2475,7 +2580,27 @@ function App() {
     );
   }
 
-  const activeTrips = misViajes.filter(v => v.status === 'En Ruta' || v.status === 'Pendiente' || v.status === 'Aceptada');
+  if (currentUser && mustChangePassword) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 p-6 flex items-center justify-center">
+        <form onSubmit={handleForcedPasswordChange} className="w-full max-w-sm bg-white border border-slate-200 rounded-3xl p-6 shadow-xl space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-orange-100 text-orange-600 flex items-center justify-center"><Lock className="w-6 h-6" /></div>
+          <div>
+            <h2 className="text-xl font-black text-slate-800">Crea una nueva contraseña</h2>
+            <p className="text-xs text-slate-500 mt-1">Ingresaste con una contraseña temporal emitida por Torre de Control. Debes cambiarla antes de continuar.</p>
+          </div>
+          <input type="password" autoComplete="new-password" placeholder="Nueva contraseña (mín. 8 caracteres)" className="w-full p-4 rounded-2xl border border-slate-200 outline-none focus:border-orange-500" value={newRecoveryPassword} onChange={e => setNewRecoveryPassword(e.target.value)} required />
+          <input type="password" autoComplete="new-password" placeholder="Confirmar nueva contraseña" className="w-full p-4 rounded-2xl border border-slate-200 outline-none focus:border-orange-500" value={confirmRecoveryPassword} onChange={e => setConfirmRecoveryPassword(e.target.value)} required />
+          {error && <p className="text-red-500 text-xs font-bold">{error}</p>}
+          <button type="submit" disabled={loading} className="w-full bg-slate-800 text-white font-black p-4 rounded-2xl flex items-center justify-center">
+            {loading ? <Loader2 className="animate-spin w-5 h-5" /> : 'GUARDAR NUEVA CONTRASEÑA'}
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+    const activeTrips = misViajes.filter(v => v.status === 'En Ruta' || v.status === 'Pendiente' || v.status === 'Aceptada');
   const pastTrips = misViajes.filter(v => v.status !== 'En Ruta' && v.status !== 'Pendiente' && v.status !== 'Aceptada');
   const isCorporate = currentUser?.type === 'Empresa';
   const chatTrip = misViajes.find(v => v.id === activeChatTripId);
