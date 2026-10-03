@@ -119,17 +119,68 @@ class TripLogixClientErrorBoundary extends React.Component {
 // + tiempo + cuota operativa + ajustes autorizados. Las tarifas son propias de
 // TripLogix y se concentran aquí para poder cambiarlas sin tocar el resto de la app.
 // =========================================================================
-const TRIPLOGIX_RECEIPT_CONFIG = Object.freeze({
-    brandName: 'TripLogix',
-    slogan: 'Movilidad inteligente, segura y regulada',
-    currency: 'MXN',
-    baseFare: 35,
-    perKm: 15,
-    perMinute: 1.5,
-    serviceFee: 12,
-    minimumFare: 75,
-    defaultDemandMultiplier: 1
+const TRIPLOGIX_PRICING_PROFILES = Object.freeze({
+    México: Object.freeze({
+        brandName: 'TripLogix',
+        slogan: 'Movilidad inteligente, segura y regulada',
+        currency: 'MXN',
+        locale: 'es-MX',
+        baseFare: 35,
+        perKm: 15,
+        perMinute: 1.5,
+        serviceFee: 12,
+        minimumFare: 75,
+        defaultDemandMultiplier: 1
+    }),
+    Colombia: Object.freeze({
+        brandName: 'TripLogix',
+        slogan: 'Movilidad inteligente, segura y regulada',
+        currency: 'COP',
+        locale: 'es-CO',
+        baseFare: 8000,
+        perKm: 3500,
+        perMinute: 350,
+        serviceFee: 3000,
+        minimumFare: 18000,
+        defaultDemandMultiplier: 1
+    })
 });
+
+const TRIPLOGIX_RECEIPT_CONFIG = TRIPLOGIX_PRICING_PROFILES.México;
+
+const DRIVER_SEARCH_RADIUS_KM = 15;
+const MAX_DRIVER_PICKUP_ETA_MINUTES = 30;
+const DRIVER_FALLBACK_AVERAGE_KMH = 30;
+
+const getCountryFromTimezone = () => {
+    try {
+        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        if (/Bogota|Colombia/i.test(timezone)) return 'Colombia';
+        if (/Mexico|Monterrey|Chihuahua|Tijuana|Hermosillo|Mazatlan|Merida|Cancun/i.test(timezone)) return 'México';
+    } catch (_) {}
+    return 'México';
+};
+
+const getCountryFromPoint = (rawPoint) => {
+    const lat = Number(rawPoint?.lat);
+    const lng = Number(rawPoint?.lng ?? rawPoint?.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return '';
+    if (lat >= 14 && lat <= 33.5 && lng >= -119 && lng <= -86) return 'México';
+    if (lat >= -5 && lat <= 13.8 && lng >= -82 && lng <= -66) return 'Colombia';
+    return '';
+};
+
+const getTripCountry = (route = {}) => (
+    route?.serviceCountry ||
+    route?.country ||
+    getCountryFromPoint(route?.startCoords) ||
+    getCountryFromTimezone()
+);
+
+const getTripLogixPricingProfile = (route = {}) => (
+    TRIPLOGIX_PRICING_PROFILES[getTripCountry(route)] ||
+    TRIPLOGIX_PRICING_PROFILES.México
+);
 
 const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
 
@@ -210,18 +261,26 @@ const calculateTripLogixFare = (route, overrides = {}) => {
         : getTripDurationMinutesForReceipt(route, overrides.actualEndTimestamp);
 
     const configuredPricing = route?.pricing || {};
-    const baseFare = Number(configuredPricing.baseFare ?? TRIPLOGIX_RECEIPT_CONFIG.baseFare);
-    const perKm = Number(configuredPricing.perKm ?? TRIPLOGIX_RECEIPT_CONFIG.perKm);
-    const perMinute = Number(configuredPricing.perMinute ?? TRIPLOGIX_RECEIPT_CONFIG.perMinute);
-    const serviceFee = Number(configuredPricing.serviceFee ?? TRIPLOGIX_RECEIPT_CONFIG.serviceFee);
-    const minimumFare = Number(configuredPricing.minimumFare ?? TRIPLOGIX_RECEIPT_CONFIG.minimumFare);
+    const defaultPricing = getTripLogixPricingProfile(route);
+    const pricingCurrency = String(
+        configuredPricing.currency ||
+        route?.currency ||
+        route?.serviceCurrency ||
+        defaultPricing.currency
+    ).toUpperCase();
+
+    const baseFare = Number(configuredPricing.baseFare ?? defaultPricing.baseFare);
+    const perKm = Number(configuredPricing.perKm ?? defaultPricing.perKm);
+    const perMinute = Number(configuredPricing.perMinute ?? defaultPricing.perMinute);
+    const serviceFee = Number(configuredPricing.serviceFee ?? defaultPricing.serviceFee);
+    const minimumFare = Number(configuredPricing.minimumFare ?? defaultPricing.minimumFare);
     const tolls = Math.max(0, Number(route?.tolls ?? configuredPricing.tolls ?? 0) || 0);
 
     const demandMultiplierRaw = Number(
         route?.demandMultiplier ??
         route?.surgeMultiplier ??
         configuredPricing.demandMultiplier ??
-        TRIPLOGIX_RECEIPT_CONFIG.defaultDemandMultiplier
+        defaultPricing.defaultDemandMultiplier
     );
     const demandMultiplier = Math.min(3, Math.max(1, Number.isFinite(demandMultiplierRaw) ? demandMultiplierRaw : 1));
 
@@ -240,7 +299,7 @@ const calculateTripLogixFare = (route, overrides = {}) => {
     const total = roundMoney(subtotal + taxes);
 
     return {
-        currency: TRIPLOGIX_RECEIPT_CONFIG.currency,
+        currency: pricingCurrency,
         distanceKm: roundMoney(distanceKm),
         durationMinutes: Math.max(0, Math.round(durationMinutes)),
         baseFare: roundMoney(baseFare),
@@ -332,14 +391,19 @@ const buildTripLogixReceipt = (route, overrides = {}) => {
 };
 
 const formatTripLogixMoney = (value, currency = 'MXN') => {
+    const normalizedCurrency = String(currency || 'MXN').toUpperCase();
+    const locale = normalizedCurrency === 'COP' ? 'es-CO' : 'es-MX';
+    const fractionDigits = normalizedCurrency === 'COP' ? 0 : 2;
+
     try {
-        return new Intl.NumberFormat('es-MX', {
+        return new Intl.NumberFormat(locale, {
             style: 'currency',
-            currency,
-            minimumFractionDigits: 2
+            currency: normalizedCurrency,
+            minimumFractionDigits: fractionDigits,
+            maximumFractionDigits: fractionDigits
         }).format(Number(value) || 0);
     } catch (e) {
-        return `$${(Number(value) || 0).toFixed(2)} ${currency}`;
+        return `${(Number(value) || 0).toFixed(fractionDigits)} ${normalizedCurrency}`;
     }
 };
 
@@ -1724,6 +1788,7 @@ function App() {
               .filter(Boolean)
       );
 
+      const originCountry = getCountryFromPoint(origin) || getCountryFromTimezone();
       const candidates = driversSnapshot.docs
           .map(item => ({ id: item.id, ...item.data() }))
           .filter(driver => driver.status === 'Aprobado')
@@ -1739,20 +1804,72 @@ function App() {
               return {
                   ...driver,
                   driverLocation,
-                  distanceMeters
+                  distanceMeters,
+                  serviceCountry: getCountryFromPoint(driverLocation)
               };
           })
+          .filter(driver => driver.driverLocation)
+          .filter(driver => !originCountry || !driver.serviceCountry || driver.serviceCountry === originCountry)
+          .filter(driver => Number.isFinite(driver.distanceMeters) && driver.distanceMeters <= DRIVER_SEARCH_RADIUS_KM * 1000)
           .sort((a, b) => {
-              const aHasLocation = Number.isFinite(a.distanceMeters);
-              const bHasLocation = Number.isFinite(b.distanceMeters);
-
-              if (aHasLocation && !bHasLocation) return -1;
-              if (!aHasLocation && bHasLocation) return 1;
               if (a.distanceMeters !== b.distanceMeters) return a.distanceMeters - b.distanceMeters;
               return String(a.name || '').localeCompare(String(b.name || ''));
-          });
+          })
+          .slice(0, 5);
 
-      return candidates[0] || null;
+      if (candidates.length === 0) return null;
+
+      if (window.google?.maps?.DistanceMatrixService && origin) {
+          try {
+              const distanceMatrixService = new window.google.maps.DistanceMatrixService();
+              const matrix = await new Promise((resolve, reject) => {
+                  distanceMatrixService.getDistanceMatrix({
+                      origins: candidates.map(driver => driver.driverLocation),
+                      destinations: [origin],
+                      travelMode: window.google.maps.TravelMode.DRIVING,
+                      unitSystem: window.google.maps.UnitSystem?.METRIC,
+                      drivingOptions: {
+                          departureTime: new Date(),
+                          trafficModel: window.google.maps.TrafficModel?.BEST_GUESS || 'bestguess'
+                      }
+                  }, (response, status) => {
+                      if (status === 'OK' && response) resolve(response);
+                      else reject(new Error(`Distance Matrix: ${status || 'sin respuesta'}`));
+                  });
+              });
+
+              const reachable = candidates
+                  .map((driver, index) => {
+                      const element = matrix?.rows?.[index]?.elements?.[0];
+                      const etaSeconds = Number(element?.duration_in_traffic?.value ?? element?.duration?.value);
+                      const roadDistanceMeters = Number(element?.distance?.value);
+                      return {
+                          ...driver,
+                          pickupEtaMinutes: Number.isFinite(etaSeconds) ? Math.max(1, Math.ceil(etaSeconds / 60)) : null,
+                          pickupRoadDistanceMeters: Number.isFinite(roadDistanceMeters) ? roadDistanceMeters : driver.distanceMeters
+                      };
+                  })
+                  .filter(driver => Number.isFinite(driver.pickupEtaMinutes) && driver.pickupEtaMinutes <= MAX_DRIVER_PICKUP_ETA_MINUTES)
+                  .sort((a, b) => {
+                      if (a.pickupEtaMinutes !== b.pickupEtaMinutes) return a.pickupEtaMinutes - b.pickupEtaMinutes;
+                      return a.pickupRoadDistanceMeters - b.pickupRoadDistanceMeters;
+                  });
+
+              return reachable[0] || null;
+          } catch (matrixError) {
+              console.warn('No se pudo calcular ETA real de recogida; se usa estimación local:', matrixError);
+          }
+      }
+
+      const fallbackCandidates = candidates
+          .map(driver => ({
+              ...driver,
+              pickupEtaMinutes: Math.max(1, Math.ceil((driver.distanceMeters / 1000) / DRIVER_FALLBACK_AVERAGE_KMH * 60)),
+              pickupRoadDistanceMeters: driver.distanceMeters
+          }))
+          .filter(driver => driver.pickupEtaMinutes <= MAX_DRIVER_PICKUP_ETA_MINUTES);
+
+      return fallbackCandidates[0] || null;
   }, []);
 
   const guardarDireccionesFrecuentes = useCallback(async (locationsToSave) => {
@@ -2266,10 +2383,28 @@ function App() {
               minute: '2-digit'
           });
 
+      const serviceCountry = getCountryFromPoint(origenCoords) || getCountryFromTimezone();
+      const pricingProfile = getTripLogixPricingProfile({
+          serviceCountry,
+          startCoords: origenCoords
+      });
+      const routePricingConfig = {
+          currency: pricingProfile.currency,
+          baseFare: pricingProfile.baseFare,
+          perKm: pricingProfile.perKm,
+          perMinute: pricingProfile.perMinute,
+          serviceFee: pricingProfile.serviceFee,
+          minimumFare: pricingProfile.minimumFare,
+          demandMultiplier: pricingProfile.defaultDemandMultiplier,
+          source: 'country-profile'
+      };
       const estimatedPricing = calculateTripLogixFare({
+          serviceCountry,
+          serviceCurrency: pricingProfile.currency,
+          pricing: routePricingConfig,
           technicalData: { totalDistance: distanceKm, totalDuration: durationMin }
       });
-      const estimatedCost = estimatedPricing.total.toFixed(2);
+      const estimatedCost = estimatedPricing.total;
       const nowIso = new Date().toISOString();
 
       const waypointAddresses = waypoints.map(waypoint => waypoint.address);
@@ -2301,6 +2436,10 @@ function App() {
             contact: currentUser.phone
         },
         serviceType: tipoServicio,
+        serviceCountry,
+        serviceCurrency: pricingProfile.currency,
+        currency: pricingProfile.currency,
+        pricing: routePricingConfig,
         scheduledDate,
         scheduledTime,
         status: 'Pendiente',
@@ -2334,6 +2473,8 @@ function App() {
           distanceKm,
           durationMin,
           estimatedCost,
+          estimatedCurrency: pricingProfile.currency,
+          serviceCountry,
           scheduledDate,
           scheduledTime
       });
@@ -2363,17 +2504,24 @@ function App() {
                     assignmentStatus: 'Oferta enviada',
                     assignmentTriedDriverIds: [conductor.id],
                     assignmentRequestedAt: nowIso,
-                    assignmentDistanceMeters: Number.isFinite(conductor.distanceMeters)
-                        ? Math.round(conductor.distanceMeters)
-                        : null
+                    assignmentDistanceMeters: Number.isFinite(conductor.pickupRoadDistanceMeters ?? conductor.distanceMeters)
+                        ? Math.round(conductor.pickupRoadDistanceMeters ?? conductor.distanceMeters)
+                        : null,
+                    assignmentEtaMinutes: Number.isFinite(conductor.pickupEtaMinutes)
+                        ? conductor.pickupEtaMinutes
+                        : null,
+                    assignmentSearchRadiusKm: DRIVER_SEARCH_RADIUS_KM,
+                    assignmentMaxEtaMinutes: MAX_DRIVER_PICKUP_ETA_MINUTES
                 }
               : {
                     ofertaPara: '',
                     ofertaParaNombre: '',
                     ofertaEstado: 'Sin disponibilidad',
-                    assignmentStatus: 'Sin conductores disponibles',
+                    assignmentStatus: `Sin conductores dentro de ${DRIVER_SEARCH_RADIUS_KM} km / ${MAX_DRIVER_PICKUP_ETA_MINUTES} min`,
                     assignmentTriedDriverIds: [],
-                    assignmentRequestedAt: nowIso
+                    assignmentRequestedAt: nowIso,
+                    assignmentSearchRadiusKm: DRIVER_SEARCH_RADIUS_KM,
+                    assignmentMaxEtaMinutes: MAX_DRIVER_PICKUP_ETA_MINUTES
                 };
 
           await addDoc(collection(db, 'rutas'), {
@@ -2399,9 +2547,9 @@ function App() {
           ]);
 
           if (conductor) {
-              alert(`¡Viaje solicitado! Se envió la solicitud al conductor disponible más cercano: ${conductor.name || 'Conductor'}.`);
+              alert(`¡Viaje solicitado! Se envió la solicitud a ${conductor.name || 'Conductor'}. Tiempo estimado de llegada: ${conductor.pickupEtaMinutes || '--'} min.`);
           } else {
-              alert('¡Viaje solicitado! En este momento no hay conductores conectados; la solicitud quedó registrada para asignación.');
+              alert(`¡Viaje solicitado! No encontramos un conductor dentro de ${DRIVER_SEARCH_RADIUS_KM} km con llegada estimada de hasta ${MAX_DRIVER_PICKUP_ETA_MINUTES} min. La solicitud quedó registrada para asignación local.`);
           }
 
           setRouteReview(null);
@@ -2631,7 +2779,7 @@ function App() {
                               </div>
                               <div className="text-right">
                                   <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
-                                  <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(finishedTripNotice).pricing.total)}</p>
+                                  <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(finishedTripNotice).pricing.total, buildTripLogixReceipt(finishedTripNotice).pricing.currency)}</p>
                               </div>
                           </div>
                       </div>
@@ -2728,7 +2876,7 @@ function App() {
                           {!isCorporate && (
                               <div className="mt-4 pt-3 border-t border-slate-200 flex justify-between items-center">
                                   <p className="text-xs font-bold text-slate-500">Tarifa estimada</p>
-                                  <p className="text-2xl font-black text-slate-800">${routeReview.estimatedCost}</p>
+                                  <p className="text-2xl font-black text-slate-800">{formatTripLogixMoney(routeReview.estimatedCost, routeReview.estimatedCurrency)}</p>
                               </div>
                           )}
                       </div>
@@ -3399,7 +3547,7 @@ function App() {
                         <p className="text-xs font-bold text-slate-400">{viaje.serviceType === 'Programado' ? `${viaje.scheduledDate} a las ${viaje.scheduledTime}` : 'Servicio Prioritario'}</p>
                       </div>
                       {!isCorporate && viaje.status === 'Finalizado' && (
-                          <div className="text-right"><p className="text-[10px] font-bold text-slate-400 uppercase">Total</p><p className="text-sm font-black text-slate-800">${buildTripLogixReceipt(viaje).pricing.total.toFixed(2)}</p></div>
+                          <div className="text-right"><p className="text-[10px] font-bold text-slate-400 uppercase">Total</p><p className="text-sm font-black text-slate-800">{formatTripLogixMoney(buildTripLogixReceipt(viaje).pricing.total, buildTripLogixReceipt(viaje).pricing.currency)}</p></div>
                       )}
                     </div>
                     <div className={`relative pl-3 border-l-2 space-y-3 mb-2 ml-1 ${viaje.status === 'Cancelado' ? 'border-red-100 opacity-60' : 'border-slate-100'}`}>
@@ -3454,7 +3602,7 @@ function App() {
                         <div className="mb-5 bg-green-50 border border-green-200 rounded-2xl p-4">
                             <p className="text-[10px] font-black uppercase tracking-widest text-green-700">Viaje seleccionado</p>
                             <p className="text-sm font-bold text-slate-800 mt-1">{(paymentTrip.start || 'Origen').split(',')[0]} → {(paymentTrip.end || 'Destino').split(',')[0]}</p>
-                            <p className="text-xl font-black text-green-700 mt-2">${Number(receipt.pricing.total || 0).toFixed(2)}</p>
+                            <p className="text-xl font-black text-green-700 mt-2">{formatTripLogixMoney(receipt.pricing.total, receipt.pricing.currency)}</p>
                             <p className="text-[10px] font-bold text-slate-500 mt-1">Vincula o revisa tu método de pago. El cargo automático requiere el backend de cobro de Stripe.</p>
                         </div>
                     );
